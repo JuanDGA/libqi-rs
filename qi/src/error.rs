@@ -113,7 +113,7 @@ impl HandlerError {
     }
 }
 
-impl messaging::handler::Error for HandlerError {
+impl messaging::handler::CallError for HandlerError {
     fn is_canceled(&self) -> bool {
         matches!(self, Self::CallCanceled)
     }

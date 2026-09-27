@@ -4,30 +4,20 @@ use crate::{
     object::{self, BoxObject, HandlerExt},
     service, Error,
 };
-use qi_value::ActionId;
-use std::{
-    collections::{hash_map, HashMap},
-    marker::PhantomData,
-};
-use std::{future::Future, sync::Arc};
-use tokio::sync::Mutex;
+use bytes::Bytes;
+use futures::{future::BoxFuture, FutureExt};
+use qi_value::{ActionId, KeyDynValueMap};
+use std::collections::{hash_map, HashMap};
+use std::sync::Arc;
+use tokio::{sync::Mutex, task};
 use tracing::info;
 
-pub(super) struct RouterHandler<Body> {
+#[derive(Default)]
+pub(super) struct RouterHandler {
     handlers: HashMap<service::Id, ServiceHandler>,
-    phantom_body: PhantomData<fn(Body) -> Body>,
 }
 
-impl<Body> Default for RouterHandler<Body> {
-    fn default() -> Self {
-        Self {
-            handlers: Default::default(),
-            phantom_body: Default::default(),
-        }
-    }
-}
-
-impl<Body> std::fmt::Debug for RouterHandler<Body> {
+impl std::fmt::Debug for RouterHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RouterHandler")
             .field("handlers", &self.handlers)
@@ -35,11 +25,7 @@ impl<Body> std::fmt::Debug for RouterHandler<Body> {
     }
 }
 
-impl<Body> RouterHandler<Body>
-where
-    Body: messaging::Body + Send,
-    Body::Error: Send + Sync + 'static,
-{
+impl RouterHandler {
     pub(super) fn insert(&mut self, name: String, info: service::Info, main_object: BoxObject) {
         self.handlers
             .insert(info.id(), ServiceHandler::new(name, info, main_object));
@@ -52,15 +38,15 @@ where
     pub(super) async fn call(
         &mut self,
         address: message::Address,
-        args: Body,
-    ) -> Result<Body, Error> {
+        args: Bytes,
+    ) -> Result<Bytes, Error> {
         let (object, ident) = self
             .try_get_request_handler(address)
             .ok_or(NoHandlerError(message::Type::Call, address))?;
         object.handler_meta_call(ident, args).await
     }
 
-    pub(super) async fn post(&mut self, address: message::Address, args: Body) {
+    pub(super) async fn post(&mut self, address: message::Address, args: Bytes) {
         let (object, action) = match self.try_get_request_handler(address) {
             Some(handler) => handler,
             None => {
@@ -71,7 +57,7 @@ where
         object.handler_meta_post(action, args).await
     }
 
-    pub(super) async fn event(&mut self, address: message::Address, args: Body) {
+    pub(super) async fn event(&mut self, address: message::Address, args: Bytes) {
         let (object, action) = match self.try_get_request_handler(address) {
             Some(handler) => handler,
             None => {
@@ -145,38 +131,31 @@ impl IntoIterator for PendingServiceMap {
     }
 }
 
-pub(super) struct ArcRouterHandler<Body>(Arc<Mutex<RouterHandler<Body>>>);
+pub(super) struct ArcRouterHandler(Arc<Mutex<RouterHandler>>);
 
-impl<Body> Clone for ArcRouterHandler<Body> {
+impl Clone for ArcRouterHandler {
     fn clone(&self) -> Self {
         Self(Arc::clone(&self.0))
     }
 }
 
-impl<Body> std::fmt::Debug for ArcRouterHandler<Body> {
+impl std::fmt::Debug for ArcRouterHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
     }
 }
 
-impl<Body> ArcRouterHandler<Body> {
-    pub(crate) fn new(services: Arc<Mutex<RouterHandler<Body>>>) -> Self {
+impl ArcRouterHandler {
+    pub(crate) fn new(services: Arc<Mutex<RouterHandler>>) -> Self {
         Self(services)
     }
 }
 
-impl<Body> messaging::Handler<Body> for ArcRouterHandler<Body>
-where
-    Body: messaging::Body + Send,
-    Body::Error: Send + Sync + 'static,
-{
+impl messaging::CallHandler for ArcRouterHandler {
     type Error = HandlerError;
+    type Future = BoxFuture<'static, Result<Bytes, Self::Error>>;
 
-    fn call(
-        &self,
-        address: message::Address,
-        value: Body,
-    ) -> impl Future<Output = Result<Body, Self::Error>> + Send {
+    fn handle_call(&self, address: message::Address, value: Bytes) -> Self::Future {
         let router = Arc::clone(&self.0);
         async move {
             router
@@ -186,23 +165,28 @@ where
                 .await
                 .map_err(HandlerError::non_fatal)
         }
+        .boxed()
     }
+}
 
-    fn fire_and_forget(
-        &self,
-        address: message::Address,
-        request: message::FireAndForget<Body>,
-    ) -> impl Future<Output = ()> + Send {
+impl messaging::EventHandler for ArcRouterHandler {
+    fn handle_event(&self, address: message::Address, value: Bytes) {
+        // The messaging loop handles events without awaiting them, so handling is spawned.
         let router = Arc::clone(&self.0);
-        async move {
-            let mut router = router.lock_owned().await;
-            match request {
-                message::FireAndForget::Post(value) => router.post(address, value).await,
-                message::FireAndForget::Event(value) => router.event(address, value).await,
-                message::FireAndForget::Capabilities(_) => {
-                    // Capabilities messages are not handled by nodes services and messaging handler.
-                }
-            }
-        }
+        task::spawn(async move { router.lock_owned().await.event(address, value).await });
+    }
+}
+
+impl messaging::PostHandler for ArcRouterHandler {
+    fn handle_post(&self, address: message::Address, value: Bytes) {
+        // The messaging loop handles posts without awaiting them, so handling is spawned.
+        let router = Arc::clone(&self.0);
+        task::spawn(async move { router.lock_owned().await.post(address, value).await });
+    }
+}
+
+impl messaging::CapabilitiesHandler for ArcRouterHandler {
+    fn handle_capabilities(&self, _address: message::Address, _data: KeyDynValueMap) {
+        // Capabilities messages are not handled by nodes services and messaging handler.
     }
 }

@@ -1,42 +1,13 @@
-use crate::{format, messaging};
-use bytes::Bytes;
+use crate::format;
 pub use qi_value::*;
+use serde::de::DeserializeSeed;
 
-#[derive(Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct BinaryFormattedValue(Bytes);
-
-impl BinaryFormattedValue {
-    #[cfg(test)]
-    pub(super) fn from_static(bytes: &'static [u8]) -> Self {
-        Self(Bytes::from_static(bytes))
-    }
-}
-
-impl messaging::Body for BinaryFormattedValue {
-    type Error = format::Error;
-    type Data = Bytes;
-
-    fn from_bytes(bytes: Bytes) -> Result<Self, Self::Error> {
-        Ok(Self(bytes))
-    }
-
-    fn into_data(self) -> Result<Self::Data, Self::Error> {
-        Ok(self.0)
-    }
-
-    fn serialize<T>(value: &T) -> Result<Self, Self::Error>
-    where
-        T: serde::Serialize,
-    {
-        format::to_bytes(value).map(Self)
-    }
-
-    fn deserialize_seed<'de, T>(&'de self, seed: T) -> Result<T::Value, Self::Error>
-    where
-        T: serde::de::DeserializeSeed<'de>,
-    {
-        seed.deserialize(&mut format::SliceDeserializer::new(&self.0))
-    }
+/// Deserializes the value held by binary formatted data, guided by its type when it is known.
+pub(crate) fn deserialize<'a>(
+    ty: Option<&Type>,
+    data: &'a [u8],
+) -> Result<Value<'a>, format::Error> {
+    value::de::ValueType(ty).deserialize(&mut format::SliceDeserializer::new(data))
 }
 
 #[derive(Debug, thiserror::Error)]

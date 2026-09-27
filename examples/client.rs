@@ -1,9 +1,9 @@
-mod args;
 mod audio;
+mod config;
 
 use anyhow::{Context, Result};
-use args::Args;
 use clap::Parser;
+use config::Args;
 use qi::ObjectExt;
 use tracing::info;
 use tracing_subscriber::fmt;

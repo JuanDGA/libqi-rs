@@ -1,7 +1,6 @@
 use crate::{
-    error::HandlerError,
-    messaging::{self, Address},
-    session::{auth::Authenticator, Session},
+    messaging::Address,
+    session::{auth::Authenticator, control::SessionHandler, Session},
 };
 use std::collections::HashMap;
 use tokio::{sync::watch, task};
@@ -23,16 +22,14 @@ impl ServerSet {
     ///
     /// If any server fails to bind to its address, then the future terminates with an error and all
     /// created servers are stopped.
-    pub(super) async fn new<Handler, Auth, Body>(
+    pub(super) async fn new<Handler, Auth>(
         handler: Handler,
         authenticator: Auth,
         addresses: impl IntoIterator<Item = Address>,
     ) -> Result<Self, std::io::Error>
     where
-        Handler: messaging::Handler<Body, Error = HandlerError> + Send + Sync + Clone + 'static,
+        Handler: SessionHandler + Clone,
         Auth: Authenticator + Clone + Send + Sync + 'static,
-        Body: messaging::Body + Send + 'static,
-        Body::Error: Send + Sync + 'static,
     {
         let (set_endpoints_sender, set_endpoints_receiver) = watch::channel(Default::default());
         let mut server_tasks = task::JoinSet::new();

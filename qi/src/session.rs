@@ -7,26 +7,23 @@ mod target;
 use self::auth::PermissiveAuthenticator;
 pub(crate) use self::{auth::Authenticator, map::Map, target::Target};
 use crate::{
-    error::{Error, FormatError, HandlerError},
+    error::{Error, FormatError},
+    format,
     messaging::{self, message},
     value::{self, KeyDynValueMap},
 };
-use control::Control;
+use control::{Control, SessionHandler};
 use futures::{stream::FusedStream, Sink, StreamExt, TryStream};
 use qi_messaging::Address;
 use std::{net::SocketAddr, pin::pin};
 use tokio::{select, sync::watch, task, time};
 
-pub(crate) struct Session<Body> {
+pub(crate) struct Session {
     capabilities: watch::Receiver<Option<KeyDynValueMap>>,
-    client: messaging::Client<Body>,
+    client: messaging::Client,
 }
 
-impl<Body> Session<Body>
-where
-    Body: messaging::Body + Send + 'static,
-    Body::Error: Send + Sync + 'static,
-{
+impl Session {
     pub(crate) async fn connect<MsgStream, MsgSink, Handler>(
         messages_stream: MsgStream,
         messages_sink: MsgSink,
@@ -34,10 +31,10 @@ where
         handler: Handler,
     ) -> Result<Self, Error>
     where
-        MsgStream: TryStream<Ok = messaging::Message<Body>> + Send + 'static,
+        MsgStream: TryStream<Ok = messaging::Message> + Send + 'static,
         MsgStream::Error: Send,
-        MsgSink: Sink<messaging::Message<Body>> + Send + 'static,
-        Handler: messaging::Handler<Body, Error = HandlerError> + Send + Sync + 'static,
+        MsgSink: Sink<messaging::Message> + Send + 'static,
+        Handler: SessionHandler + Clone,
     {
         let Control {
             controller,
@@ -45,13 +42,13 @@ where
             handler,
             ..
         } = control::make(handler, PermissiveAuthenticator, true);
-        let (mut client, connection) =
+        let (client, connection) =
             messaging::endpoint::start(messages_stream, messages_sink, handler);
         task::spawn(async move {
             let _res = connection.await;
         });
         controller
-            .authenticate_to_server(&mut client, credentials)
+            .authenticate_to_server(&client, credentials)
             .await?;
         Ok(Session {
             capabilities,
@@ -80,7 +77,7 @@ where
     ) -> Result<Server, std::io::Error>
     where
         Auth: Authenticator + Clone + Send + Sync + 'static,
-        Handler: messaging::Handler<Body, Error = HandlerError> + Send + Sync + Clone + 'static,
+        Handler: SessionHandler + Clone,
     {
         let (clients, local_address) = messaging::channel::serve(address).await?;
         let (mut endpoints_sender, endpoints_receiver) =
@@ -125,11 +122,11 @@ where
         authenticator: Auth,
         handler: Handler,
     ) where
-        MsgStream: TryStream<Ok = messaging::Message<Body>> + Send + 'static,
+        MsgStream: TryStream<Ok = messaging::Message> + Send + 'static,
         MsgStream::Error: Send,
-        MsgSink: Sink<messaging::Message<Body>> + Send + 'static,
+        MsgSink: Sink<messaging::Message> + Send + 'static,
         Auth: Authenticator + Send + Sync + 'static,
-        Handler: messaging::Handler<Body, Error = HandlerError> + Send + Sync + 'static,
+        Handler: SessionHandler + Clone,
     {
         let Control {
             capabilities,
@@ -162,29 +159,34 @@ where
         value: value::Value<'_>,
         return_type: Option<&value::Type>,
     ) -> Result<value::Value<'static>, Error> {
-        let args = Body::serialize(&value).map_err(FormatError::ArgumentsSerialization)?;
-        Ok(self
-            .client
-            .call(address, args)
-            .await?
-            .deserialize_seed(value::de::ValueType(return_type))
+        let args = format::to_bytes(&value).map_err(FormatError::ArgumentsSerialization)?;
+        let reply = self.client.call(address, args).await?;
+        Ok(value::deserialize(return_type, &reply)
             .map_err(FormatError::MethodReturnValueDeserialization)?
             .into_owned())
     }
 
-    pub(crate) async fn fire_and_forget(
+    pub(crate) async fn post(
         &self,
         address: message::Address,
-        request: message::FireAndForget<value::Value<'_>>,
+        args: value::Value<'_>,
     ) -> Result<(), Error> {
-        let request = request
-            .try_map(|value| Body::serialize(&value))
-            .map_err(FormatError::ArgumentsSerialization)?;
-        self.client.fire_and_forget(address, request).await?;
+        let args = format::to_bytes(&args).map_err(FormatError::ArgumentsSerialization)?;
+        self.client.post(address, args).await?;
         Ok(())
     }
 
-    pub(crate) fn downgrade(&self) -> WeakSession<Body> {
+    pub(crate) async fn send_event(
+        &self,
+        address: message::Address,
+        value: value::Value<'_>,
+    ) -> Result<(), Error> {
+        let value = format::to_bytes(&value).map_err(FormatError::ArgumentsSerialization)?;
+        self.client.send_event(address, value).await?;
+        Ok(())
+    }
+
+    pub(crate) fn downgrade(&self) -> WeakSession {
         WeakSession {
             capabilities: self.capabilities.clone(),
             client: self.client.downgrade(),
@@ -192,7 +194,7 @@ where
     }
 }
 
-impl<Body> Clone for Session<Body> {
+impl Clone for Session {
     fn clone(&self) -> Self {
         Self {
             capabilities: self.capabilities.clone(),
@@ -201,7 +203,7 @@ impl<Body> Clone for Session<Body> {
     }
 }
 
-impl<Body> std::fmt::Debug for Session<Body> {
+impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Session")
             .field("capabilities", &self.capabilities)
@@ -210,13 +212,13 @@ impl<Body> std::fmt::Debug for Session<Body> {
     }
 }
 
-pub(crate) struct WeakSession<Body> {
+pub(crate) struct WeakSession {
     capabilities: watch::Receiver<Option<KeyDynValueMap>>,
-    client: messaging::WeakClient<Body>,
+    client: messaging::WeakClient,
 }
 
-impl<Body> WeakSession<Body> {
-    pub(crate) fn upgrade(&self) -> Option<Session<Body>> {
+impl WeakSession {
+    pub(crate) fn upgrade(&self) -> Option<Session> {
         self.client.upgrade().map(|client| Session {
             capabilities: self.capabilities.clone(),
             client,
@@ -224,7 +226,7 @@ impl<Body> WeakSession<Body> {
     }
 }
 
-impl<Body> Clone for WeakSession<Body> {
+impl Clone for WeakSession {
     fn clone(&self) -> Self {
         Self {
             capabilities: self.capabilities.clone(),
@@ -233,7 +235,7 @@ impl<Body> Clone for WeakSession<Body> {
     }
 }
 
-impl<Body> std::fmt::Debug for WeakSession<Body> {
+impl std::fmt::Debug for WeakSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WeakSession")
             .field("capabilities", &self.capabilities)
@@ -315,69 +317,40 @@ async fn update_address_endpoints(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::messaging::Message;
+    use crate::{messaging::Message, HandlerError};
     use assert_matches::assert_matches;
-    use futures::{channel::mpsc, SinkExt, StreamExt};
-    use qi_messaging::Body;
-    use serde_json as json;
-    use std::{
-        collections::VecDeque,
-        convert::Infallible,
-        future::{ready, Future},
+    use bytes::Bytes;
+    use futures::{
+        channel::mpsc,
+        future::{ok, Ready},
+        SinkExt, StreamExt,
     };
+    use qi_messaging::message::KeyDynValueMap;
+    use std::convert::Infallible;
     use tokio::spawn;
 
     #[derive(Clone, Copy)]
     struct DummyHandler;
 
-    impl messaging::Handler<JsonBody> for DummyHandler {
+    impl messaging::CallHandler for DummyHandler {
         type Error = HandlerError;
+        type Future = Ready<Result<Bytes, Self::Error>>;
 
-        async fn call(
-            &self,
-            _address: message::Address,
-            value: JsonBody,
-        ) -> Result<JsonBody, Self::Error> {
-            Ok(value)
-        }
-
-        fn fire_and_forget(
-            &self,
-            _address: message::Address,
-            _request: message::FireAndForget<JsonBody>,
-        ) -> impl Future<Output = ()> + Send {
-            ready(())
+        fn handle_call(&self, _address: message::Address, args: Bytes) -> Self::Future {
+            ok(args)
         }
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    struct JsonBody(json::Value);
+    impl messaging::EventHandler for DummyHandler {
+        fn handle_event(&self, _address: message::Address, _args: Bytes) {}
+    }
 
-    impl messaging::Body for JsonBody {
-        type Error = json::Error;
-        type Data = VecDeque<u8>;
+    impl messaging::PostHandler for DummyHandler {
+        fn handle_post(&self, _address: message::Address, _args: Bytes) {}
+    }
 
-        fn from_bytes(bytes: bytes::Bytes) -> Result<Self, Self::Error> {
-            json::from_slice(&bytes).map(Self)
-        }
-
-        fn into_data(self) -> Result<Self::Data, Self::Error> {
-            json::to_vec(&self.0).map(Into::into)
-        }
-
-        fn serialize<T>(value: &T) -> Result<Self, Self::Error>
-        where
-            T: serde::Serialize,
-        {
-            json::to_value(value).map(Self)
-        }
-
-        fn deserialize_seed<'de, T>(&'de self, seed: T) -> Result<T::Value, Self::Error>
-        where
-            T: serde::de::DeserializeSeed<'de>,
-        {
-            seed.deserialize(self.0.clone())
-        }
+    impl messaging::CapabilitiesHandler for DummyHandler {
+        fn handle_capabilities(&self, _address: message::Address, _capabilities: KeyDynValueMap) {}
     }
 
     /// The server session receives an authentication request with incompatible capabilities.
@@ -402,7 +375,7 @@ mod tests {
             .send(Message::Call {
                 id: message::Id(0),
                 address: control::AUTHENTICATE_ADDRESS,
-                value: JsonBody::serialize(&{
+                payload: format::to_bytes(&{
                     let mut map = KeyDynValueMap::new();
                     map.set("RemoteCancelableCalls", true);
                     map.set("ObjectPtrUID", true);
@@ -464,7 +437,7 @@ mod tests {
             .send(Message::Reply {
                 id: message::Id(1),
                 address: control::AUTHENTICATE_ADDRESS,
-                value: JsonBody::serialize(&{
+                payload: format::to_bytes(&{
                     let mut map = KeyDynValueMap::new();
                     map.set("RemoteCancelableCalls", true);
                     map.set("ObjectPtrUID", true);
@@ -503,7 +476,7 @@ mod tests {
             .send(Message::Call {
                 id: message::Id(0),
                 address: control::AUTHENTICATE_ADDRESS,
-                value: JsonBody::serialize(&{
+                payload: format::to_bytes(&{
                     let mut map = KeyDynValueMap::new();
                     map.set("RemoteCancelableCalls", true);
                     map.set("ObjectPtrUID", true);
@@ -519,16 +492,16 @@ mod tests {
 
         // 1.
         let response = recv_from_server.next().await.unwrap();
-        let body = assert_matches!(
+        let payload = assert_matches!(
             response,
             Message::Reply {
                 address: control::AUTHENTICATE_ADDRESS,
                 id: message::Id(0),
-                value: body
-            } => body
+                payload
+            } => payload
         );
 
-        let mut map: KeyDynValueMap = body.deserialize().unwrap();
+        let mut map: KeyDynValueMap = format::from_slice(&payload).unwrap();
         let state: u32 = map
             .remove(auth::STATE_KEY)
             .unwrap_or_else(|| panic!("missing state key in map {map:?}"))
@@ -562,7 +535,7 @@ mod tests {
             .send(Message::Call {
                 id: message::Id(0),
                 address: control::AUTHENTICATE_ADDRESS,
-                value: JsonBody::serialize(&{
+                payload: format::to_bytes(&{
                     let mut map = KeyDynValueMap::new();
                     map.set("RemoteCancelableCalls", true);
                     map.set("ObjectPtrUID", true);

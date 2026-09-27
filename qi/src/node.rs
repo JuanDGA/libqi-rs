@@ -3,7 +3,6 @@ mod server;
 
 use self::router_handler::{PendingServiceMap, RouterHandler};
 use crate::{
-    messaging,
     object::{self, BoxObject, Object},
     service::{self, Info},
     service_directory::{self, ServiceDirectory},
@@ -11,7 +10,7 @@ use crate::{
         self,
         auth::{Authenticator, PermissiveAuthenticator},
     },
-    value::{self, os::MachineId},
+    value::os::MachineId,
     Address, Error,
 };
 use futures::{stream, StreamExt, TryStreamExt};
@@ -19,47 +18,31 @@ use qi_value::KeyDynValueMap;
 use router_handler::ArcRouterHandler;
 use serde_with::serde_as;
 use server::ServerSet;
-use std::{collections::HashMap, marker::PhantomData, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 use tokio::{sync::Mutex, task};
 
-pub struct Builder<Auth, Method, Body> {
+pub struct Builder<Auth, Method> {
     uid: Uid,
     authenticator: Auth,
     bind_addresses: Vec<Address>,
     pending_services: PendingServiceMap,
     method: Method,
-    phantom_body: PhantomData<fn(Body) -> Body>,
 }
 
-impl Builder<PermissiveAuthenticator, (), value::BinaryFormattedValue> {
+impl Builder<PermissiveAuthenticator, ()> {
     pub fn new() -> Self {
         Builder::default()
     }
 }
 
-impl<Auth, Method, Body> Builder<Auth, Method, Body> {
-    pub fn with_authenticator<NewAuth>(
-        self,
-        authenticator: NewAuth,
-    ) -> Builder<NewAuth, Method, Body> {
+impl<Auth, Method> Builder<Auth, Method> {
+    pub fn with_authenticator<NewAuth>(self, authenticator: NewAuth) -> Builder<NewAuth, Method> {
         Builder {
             authenticator,
             uid: self.uid,
             bind_addresses: self.bind_addresses,
             pending_services: self.pending_services,
             method: self.method,
-            phantom_body: PhantomData,
-        }
-    }
-
-    pub fn with_body<NewBody>(self) -> Builder<Auth, Method, Body> {
-        Builder {
-            authenticator: self.authenticator,
-            uid: self.uid,
-            bind_addresses: self.bind_addresses,
-            pending_services: self.pending_services,
-            method: self.method,
-            phantom_body: PhantomData,
         }
     }
 
@@ -85,7 +68,7 @@ impl<Auth, Method, Body> Builder<Auth, Method, Body> {
         self,
         address: Address,
         credentials: Option<KeyDynValueMap>,
-    ) -> Builder<Auth, ConnectToSpace, Body> {
+    ) -> Builder<Auth, ConnectToSpace> {
         Builder {
             authenticator: self.authenticator,
             uid: self.uid,
@@ -95,30 +78,26 @@ impl<Auth, Method, Body> Builder<Auth, Method, Body> {
                 address,
                 credentials,
             },
-            phantom_body: PhantomData,
         }
     }
 
     /// Host a new space on this node.
-    pub fn host_space<A>(self) -> Builder<Auth, HostSpace, Body> {
+    pub fn host_space<A>(self) -> Builder<Auth, HostSpace> {
         Builder {
             authenticator: self.authenticator,
             uid: self.uid,
             bind_addresses: self.bind_addresses,
             pending_services: self.pending_services,
             method: HostSpace,
-            phantom_body: PhantomData,
         }
     }
 }
 
-impl<Auth, Body> Builder<Auth, ConnectToSpace, Body>
+impl<Auth> Builder<Auth, ConnectToSpace>
 where
     Auth: Authenticator + Send + Sync + Clone + 'static,
-    Body: messaging::Body + Send + 'static,
-    Body::Error: Send + Sync + 'static,
 {
-    pub async fn start(self) -> Result<Node<service_directory::Client<Body>, Body>, Error> {
+    pub async fn start(self) -> Result<Node<service_directory::Client>, Error> {
         let services = Arc::default();
         let handler = ArcRouterHandler::new(Arc::clone(&services));
         let server_set =
@@ -144,9 +123,9 @@ where
     }
 }
 
-impl<Auth, Method, Body> Builder<Auth, Method, Body> {}
+impl<Auth, Method> Builder<Auth, Method> {}
 
-impl<Auth, Method, Body> Default for Builder<Auth, Method, Body>
+impl<Auth, Method> Default for Builder<Auth, Method>
 where
     Auth: Default,
     Method: Default,
@@ -158,12 +137,11 @@ where
             bind_addresses: Default::default(),
             pending_services: Default::default(),
             method: Default::default(),
-            phantom_body: Default::default(),
         }
     }
 }
 
-impl<Auth, Method, Body> std::fmt::Debug for Builder<Auth, Method, Body>
+impl<Auth, Method> std::fmt::Debug for Builder<Auth, Method>
 where
     Auth: std::fmt::Debug,
     Method: std::fmt::Debug,
@@ -179,19 +157,17 @@ where
     }
 }
 
-pub struct Node<SD, Body> {
+pub struct Node<SD> {
     uid: Uid,
-    services: Arc<Mutex<RouterHandler<Body>>>,
-    session_map: session::Map<Body, ArcRouterHandler<Body>>,
+    services: Arc<Mutex<RouterHandler>>,
+    session_map: session::Map<ArcRouterHandler>,
     service_directory: SD,
     server_set: ServerSet,
 }
 
-impl<SD, Body> Node<SD, Body>
+impl<SD> Node<SD>
 where
     SD: ServiceDirectory + Clone + Send + 'static,
-    Body: messaging::Body + Send + 'static,
-    Body::Error: Send + Sync + 'static,
 {
     async fn init_services(&mut self, pending_services: PendingServiceMap) -> Result<(), Error> {
         let mut server_endpoints_receiver = self.server_set.endpoints_receiver().clone();
@@ -245,11 +221,9 @@ where
     }
 }
 
-impl<SD, Body> Node<SD, Body>
+impl<SD> Node<SD>
 where
     SD: ServiceDirectory,
-    Body: messaging::Body + Send + 'static,
-    Body::Error: Send + Sync + 'static,
 {
     pub async fn service(&self, name: &str) -> Result<impl Object + Clone, Error> {
         let service = self.service_directory.service(name).await?;
@@ -277,7 +251,7 @@ where
     }
 }
 
-impl<SD, Body> std::fmt::Debug for Node<SD, Body>
+impl<SD> std::fmt::Debug for Node<SD>
 where
     SD: std::fmt::Debug,
 {

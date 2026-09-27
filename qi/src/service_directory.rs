@@ -1,6 +1,5 @@
 use crate::{
     error::Error,
-    messaging,
     object::{self, Object, ObjectExt},
     service, session,
     value::{
@@ -24,10 +23,10 @@ pub trait ServiceDirectory: Object {
     async fn update_service_info(&self, info: &service::Info) -> Result<(), Error>;
 }
 
-pub struct Client<Body>(object::Proxy<Body>);
+pub struct Client(object::Proxy);
 
-impl<Body> Client<Body> {
-    pub(super) fn new(session: session::Session<Body>) -> Self {
+impl Client {
+    pub(super) fn new(session: session::Session) -> Self {
         Self(object::Proxy::new(
             SERVICE_ID,
             service::MAIN_OBJECT_ID,
@@ -38,24 +37,20 @@ impl<Body> Client<Body> {
     }
 }
 
-impl<Body> Clone for Client<Body> {
+impl Clone for Client {
     fn clone(&self) -> Self {
         Self(self.0.clone())
     }
 }
 
-impl<Body> std::fmt::Debug for Client<Body> {
+impl std::fmt::Debug for Client {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("Client").field(&self.0).finish()
     }
 }
 
 #[async_trait]
-impl<Body> Object for Client<Body>
-where
-    Body: messaging::Body + Send + 'static,
-    Body::Error: Send + Sync + 'static,
-{
+impl Object for Client {
     fn meta(&self) -> &MetaObject {
         self.0.meta()
     }
@@ -82,11 +77,7 @@ where
 }
 
 #[async_trait]
-impl<Body> ServiceDirectory for Client<Body>
-where
-    Body: messaging::Body + Send + 'static,
-    Body::Error: Send + Sync + 'static,
-{
+impl ServiceDirectory for Client {
     async fn services(&self) -> Result<Vec<service::Info>, Error> {
         self.0.call(Meta::get().services, ()).await
     }

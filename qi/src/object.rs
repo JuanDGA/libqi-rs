@@ -1,12 +1,14 @@
 pub use crate::value::ObjectId as Id;
 use crate::{
     error::{FormatError, ValueConversionError},
-    messaging::{self, message},
+    format,
+    messaging::message,
     session::Session,
     value::{self, ActionId, Dynamic, FromValue, IntoValue, ServiceId, Value},
     Error,
 };
 use async_trait::async_trait;
+use bytes::Bytes;
 use sealed::sealed;
 use tracing::{info, warn};
 pub use value::object::{Uid, *};
@@ -121,21 +123,21 @@ pub trait ObjectExt: Object {
 #[async_trait]
 impl<O> ObjectExt for O where O: Object + Sync + ?Sized {}
 
-pub struct Proxy<Body> {
+pub struct Proxy {
     service_id: ServiceId,
     id: Id,
     uid: Uid,
     meta: MetaObject,
-    session: Session<Body>,
+    session: Session,
 }
 
-impl<Body> Proxy<Body> {
+impl Proxy {
     pub(super) fn new(
         service_id: ServiceId,
         id: Id,
         uid: Uid,
         meta: MetaObject,
-        session: Session<Body>,
+        session: Session,
     ) -> Self {
         Self {
             service_id,
@@ -145,18 +147,12 @@ impl<Body> Proxy<Body> {
             session,
         }
     }
-}
 
-impl<Body> Proxy<Body>
-where
-    Body: messaging::Body + Send + 'static,
-    Body::Error: Send + Sync + 'static,
-{
     pub(super) async fn connect(
         service_id: ServiceId,
         id: Id,
         uid: Uid,
-        session: Session<Body>,
+        session: Session,
     ) -> Result<Self, Error> {
         let meta = Self::fetch_meta_object(&session, service_id, id).await?;
         Ok(Self {
@@ -169,7 +165,7 @@ where
     }
 
     async fn fetch_meta_object(
-        session: &Session<Body>,
+        session: &Session,
         service_id: ServiceId,
         id: Id,
     ) -> Result<MetaObject, Error> {
@@ -187,7 +183,7 @@ where
     }
 }
 
-impl<Body> Clone for Proxy<Body> {
+impl Clone for Proxy {
     fn clone(&self) -> Self {
         Self {
             service_id: self.service_id,
@@ -199,7 +195,7 @@ impl<Body> Clone for Proxy<Body> {
     }
 }
 
-impl<Body> std::fmt::Debug for Proxy<Body> {
+impl std::fmt::Debug for Proxy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Proxy")
             .field("service_id", &self.service_id)
@@ -212,11 +208,7 @@ impl<Body> std::fmt::Debug for Proxy<Body> {
 }
 
 #[async_trait]
-impl<Body> Object for Proxy<Body>
-where
-    Body: messaging::Body + Send + 'static,
-    Body::Error: Send + Sync + 'static,
-{
+impl Object for Proxy {
     fn meta(&self) -> &MetaObject {
         &self.meta
     }
@@ -252,9 +244,9 @@ where
         };
         if let Err(err) = self
             .session
-            .fire_and_forget(
+            .post(
                 message::Address(self.service_id, self.id, target.action_id()),
-                message::FireAndForget::Post(args),
+                args,
             )
             .await
         {
@@ -278,9 +270,9 @@ where
         };
         if let Err(err) = self
             .session
-            .fire_and_forget(
+            .send_event(
                 message::Address(self.service_id, self.id, signal.uid),
-                message::FireAndForget::Event(value),
+                value,
             )
             .await
         {
@@ -328,15 +320,8 @@ impl<'a> PostTarget<'a> {
 /// messaging address as parameter, while this interface only takes action identifiers (so without the
 /// service and object identifiers in messaging addresses).
 #[async_trait]
-pub(super) trait HandlerExt<Body>: Object
-where
-    Body: messaging::Body + Send,
-    Body::Error: std::error::Error + Send + Sync + 'static,
-{
-    async fn handler_meta_call<'a>(&'a self, action: ActionId, args: Body) -> Result<Body, Error>
-    where
-        Body: 'a,
-    {
+pub(super) trait HandlerExt: Object {
+    async fn handler_meta_call(&self, action: ActionId, args: Bytes) -> Result<Bytes, Error> {
         // Get the targeted method so that we can get the expected parameters type and know what
         // type of value we're supposed to deserialize.
         let action_ident = MemberIdent::Id(action);
@@ -344,17 +329,13 @@ where
             .meta()
             .method(&action_ident)
             .ok_or_else(|| Error::MethodNotFound(action_ident.clone()))?;
-        let args = args
-            .deserialize_seed(value::de::ValueType(method.parameters_signature.to_type()))
+        let args = value::deserialize(method.parameters_signature.to_type(), &args)
             .map_err(FormatError::ArgumentsDeserialization)?;
         let reply = self.meta_call(action_ident, args).await?;
-        Ok(Body::serialize(&reply).map_err(FormatError::MethodReturnValueSerialization)?)
+        Ok(format::to_bytes(&reply).map_err(FormatError::MethodReturnValueSerialization)?)
     }
 
-    async fn handler_meta_post<'a>(&'a self, action: ActionId, args: Body)
-    where
-        Body: 'a,
-    {
+    async fn handler_meta_post(&self, action: ActionId, args: Bytes) {
         // Same as for "call", we need to know the type of parameters to know what to deserialize.
         let action_ident = MemberIdent::Id(action);
         let target = match PostTarget::get(self.meta(), &action_ident) {
@@ -367,9 +348,7 @@ where
                 return;
             }
         };
-        match args.deserialize_seed(value::de::ValueType(
-            target.parameters_signature().to_type(),
-        )) {
+        match value::deserialize(target.parameters_signature().to_type(), &args) {
             Ok(args) => self.meta_post(action_ident, args).await,
             Err(err) => info!(
                 error = &err as &dyn std::error::Error,
@@ -378,10 +357,7 @@ where
         };
     }
 
-    async fn handler_meta_event<'a>(&'a self, action: ActionId, args: Body)
-    where
-        Body: 'a,
-    {
+    async fn handler_meta_event(&self, action: ActionId, args: Bytes) {
         let action_ident = MemberIdent::Id(action);
         let signal = match self.meta().signal(&action_ident) {
             Some(signal) => signal,
@@ -393,7 +369,7 @@ where
                 return;
             }
         };
-        match args.deserialize_seed(value::de::ValueType(signal.signature.to_type())) {
+        match value::deserialize(signal.signature.to_type(), &args) {
             Ok(args) => self.meta_event(action_ident, args).await,
             Err(err) => info!(
                 error = &err as &dyn std::error::Error,
@@ -403,13 +379,7 @@ where
     }
 }
 
-impl<Body, O> HandlerExt<Body> for O
-where
-    O: Object + Sync + ?Sized,
-    Body: messaging::Body + Send,
-    Body::Error: std::error::Error + Send + Sync + 'static,
-{
-}
+impl<O> HandlerExt for O where O: Object + Sync + ?Sized {}
 
 #[cfg(test)]
 mod tests {
