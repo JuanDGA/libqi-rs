@@ -48,41 +48,32 @@ pub fn proc_macro_derive_from_value(input: TokenStream) -> TokenStream {
 
 /// Declares an object type.
 ///
-/// This macro declares a new trait and implements `qi::Object` for any
-/// type that implements that trait. It also declares a client type that
-/// implements that trait to call the object interface remotely.
+/// Checks `#[qi::method]`, `#[qi::property]`, and `#[qi::signal]` members
+/// and emits the trait with those attributes removed.
 ///
 /// # Example
 ///
 /// ```
 /// # mod qi {
-/// #   pub(super) use qi_macros::{object, Valuable};
+/// #   pub(super) use qi_macros::object;
 /// # }
+/// # struct Position;
+/// # struct Error;
 /// #[qi::object]
 /// trait Motion {
 ///     /// Go to some position.
-///     #[qi::method]
+///     #[qi::method(name = "goTo")]
 ///     async fn go_to(&self, position: Position) -> Result<(), Error>;
 ///
 ///     /// The current position.
 ///     #[qi::property]
-///     fn position() -> Position;
+///     fn position(&self) -> Position;
 ///
 ///     /// The moving state.
 ///     #[qi::signal]
-///     fn moving() -> bool;
-/// }
-///
-/// #[derive(qi::Valuable)]
-/// ##[qi(value(crate = "qi_value"))]
-/// struct Position {
-///     x: u32,
-///     y: u32,
+///     fn moving(&self) -> bool;
 /// }
 /// ```
-///
-/// This code declares the trait `Motion` and and a type `MotionClient`
-/// that implements `Motion`.
 #[proc_macro_attribute]
 pub fn object(_attr: TokenStream, item: TokenStream) -> TokenStream {
     parse_macro_input!(item as object::Object)
