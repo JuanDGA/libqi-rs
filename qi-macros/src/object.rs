@@ -1,5 +1,5 @@
 use convert_case::{Case, Casing};
-use proc_macro2::TokenStream;
+use proc_macro2::{Span, TokenStream};
 use quote::{quote, ToTokens};
 use syn::{
     parse::{Parse, ParseStream},
@@ -14,8 +14,13 @@ pub(super) struct Object {
 
 impl ToTokens for Object {
     fn to_tokens(&self, tokens: &mut TokenStream) {
-        self.trait_item.to_tokens(tokens);
+        let trait_item = &self.trait_item;
+        tokens.extend(quote! {
+            #[::async_trait::async_trait]
+            #trait_item
+        });
         self.meta_object().to_tokens(tokens);
+        self.object_impl().to_tokens(tokens);
     }
 }
 
@@ -32,6 +37,62 @@ impl Object {
                     #(#members)*
                     builder.build()
                 });
+        }
+    }
+
+    // Each expansion emits `impl<T: Trait> Object for T`, so a crate can
+    // define only one `#[qi::object]` trait.
+    fn object_impl(&self) -> TokenStream {
+        let trait_ident = &self.trait_item.ident;
+        let meta_ident = meta_object_ident(trait_ident);
+        let method_arms = self.members.iter().filter_map(|member| match member {
+            Member::Method(method) => Some(method.to_call_arm()),
+            Member::Signal(_) | Member::Property(_) => None,
+        });
+        quote! {
+            #[::async_trait::async_trait]
+            impl<T> ::qi::Object for T
+            where
+                T: #trait_ident + ::std::marker::Send + ::std::marker::Sync,
+            {
+                fn meta(&self) -> &::qi::object::MetaObject {
+                    &*#meta_ident
+                }
+
+                async fn meta_call(
+                    &self,
+                    ident: ::qi::object::MemberIdent,
+                    args: ::qi::Value<'_>,
+                ) -> ::std::result::Result<::qi::Value<'static>, ::qi::Error> {
+                    let method = #meta_ident
+                        .method(&ident)
+                        .ok_or_else(|| ::qi::Error::MethodNotFound(ident))?;
+                    match method.name.as_str() {
+                        #(#method_arms)*
+                        _ => {
+                            let _ = args;
+                            ::std::result::Result::Err(::qi::Error::MethodNotFound(
+                                ::qi::object::MemberIdent::from(method.name.clone()),
+                            ))
+                        }
+                    }
+                }
+
+                async fn meta_post(
+                    &self,
+                    ident: ::qi::object::MemberIdent,
+                    args: ::qi::Value<'_>,
+                ) {
+                    let _res = self.meta_call(ident, args).await;
+                }
+
+                async fn meta_event(
+                    &self,
+                    _ident: ::qi::object::MemberIdent,
+                    _value: ::qi::Value<'_>,
+                ) {
+                }
+            }
         }
     }
 }
@@ -114,6 +175,39 @@ impl Method {
                 method.return_value().set_type(<#return_ty as ::qi::value::Reflect>::ty());
                 method.build()
             });
+        }
+    }
+
+    fn to_call_arm(&self) -> TokenStream {
+        let name = &self.name;
+        let ident = &self.func.sig.ident;
+        let arg_idents = method_arg_idents(&self.func);
+        let unpack = match arg_idents.len() {
+            0 => quote!(()),
+            1 => {
+                let arg = &arg_idents[0];
+                quote!(#arg)
+            }
+            _ => quote!((#(#arg_idents),*)),
+        };
+        let call = if self.func.sig.asyncness.is_some() {
+            quote! { self.#ident(#(#arg_idents),*).await }
+        } else {
+            quote! { self.#ident(#(#arg_idents),*) }
+        };
+        let value = match &self.func.sig.output {
+            ReturnType::Type(_, ty) if is_result(ty) => quote! {
+                #call.map_err(::std::convert::Into::<::qi::Error>::into)?
+            },
+            _ => call,
+        };
+        quote! {
+            #name => {
+                let #unpack = args
+                    .cast_into()
+                    .map_err(|err| ::qi::Error::from(::qi::BoxError::from(err)))?;
+                ::std::result::Result::Ok(::qi::value::IntoValue::into_value(#value))
+            }
         }
     }
 }
@@ -387,20 +481,42 @@ fn payload_type(func: &TraitItemFn) -> TokenStream {
 }
 
 fn unwrap_result(ty: &Type) -> &Type {
+    result_ok_type(ty).unwrap_or(ty)
+}
+
+fn is_result(ty: &Type) -> bool {
+    result_ok_type(ty).is_some()
+}
+
+fn result_ok_type(ty: &Type) -> Option<&Type> {
     let Type::Path(path) = ty else {
-        return ty;
+        return None;
     };
-    let Some(last) = path.path.segments.last() else {
-        return ty;
-    };
+    let last = path.path.segments.last()?;
     if last.ident != "Result" {
-        return ty;
+        return None;
     }
     let syn::PathArguments::AngleBracketed(args) = &last.arguments else {
-        return ty;
+        return None;
     };
     match args.args.first() {
-        Some(syn::GenericArgument::Type(inner)) => inner,
-        _ => ty,
+        Some(syn::GenericArgument::Type(inner)) => Some(inner),
+        _ => None,
     }
+}
+
+fn method_arg_idents(func: &TraitItemFn) -> Vec<Ident> {
+    func.sig
+        .inputs
+        .iter()
+        .filter_map(|input| match input {
+            FnArg::Typed(typed) => Some(typed),
+            _ => None,
+        })
+        .enumerate()
+        .map(|(index, typed)| match &*typed.pat {
+            Pat::Ident(pat) => pat.ident.clone(),
+            _ => Ident::new(&format!("arg_{index}"), Span::call_site()),
+        })
+        .collect()
 }

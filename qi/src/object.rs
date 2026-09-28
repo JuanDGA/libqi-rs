@@ -384,56 +384,53 @@ impl<O> HandlerExt for O where O: Object + Sync + ?Sized {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::value::Reflect;
     use assert_matches::assert_matches;
     use async_trait::async_trait;
-    use once_cell::sync::Lazy;
-    use qi_value::{
-        object::{MetaMethod, MetaObject},
-        ActionId, Type, Value,
-    };
     use tokio::sync::Mutex;
 
-    #[derive(Debug)]
-    struct Calculator {
-        a: i32,
+    #[allow(dead_code)]
+    #[qi::object]
+    trait Calculator {
+        /// Go to some position.
+        #[qi::method(name = "goTo")]
+        async fn go_to(&self, position: i32) -> Result<(), Error>;
+
+        /// The current position.
+        #[qi::property]
+        fn position(&self) -> i32;
+
+        /// The moving state.
+        #[qi::signal]
+        fn moving(&self) -> bool;
+
+        #[qi::method]
+        async fn add(&self, b: i32) -> i32;
+
+        #[qi::method]
+        async fn sub(&self, b: i32) -> i32;
+
+        #[qi::method]
+        async fn mul(&self, b: i32) -> i32;
+
+        #[qi::method]
+        async fn div(&self, b: i32) -> std::result::Result<i32, DivisionByZeroError>;
+
+        #[qi::method]
+        async fn clamp(&self, min: i32, max: i32) -> i32;
+
+        #[qi::method]
+        async fn ans(&self) -> i32;
     }
 
-    impl Calculator {
+    #[derive(Debug)]
+    struct Calc {
+        a: Mutex<i32>,
+    }
+
+    impl Calc {
         fn new(a: i32) -> Self {
-            Self { a }
-        }
-
-        fn add(&mut self, b: i32) -> i32 {
-            self.a += b;
-            self.a
-        }
-
-        fn sub(&mut self, b: i32) -> i32 {
-            self.a -= b;
-            self.a
-        }
-
-        fn mul(&mut self, b: i32) -> i32 {
-            self.a *= b;
-            self.a
-        }
-
-        fn div(&mut self, b: i32) -> std::result::Result<i32, DivisionByZeroError> {
-            if b == 0 {
-                Err(DivisionByZeroError)
-            } else {
-                self.a /= b;
-                Ok(self.a)
-            }
-        }
-
-        fn clamp(&mut self, min: i32, max: i32) -> i32 {
-            self.a = self.a.clamp(min, max);
-            self.a
-        }
-
-        fn ans(&self) -> i32 {
-            self.a
+            Self { a: Mutex::new(a) }
         }
     }
 
@@ -441,186 +438,68 @@ mod tests {
     #[error("division by zero")]
     struct DivisionByZeroError;
 
-    #[derive(Debug)]
-    struct Meta {
-        object: MetaObject,
-        methods: MethodIds,
-    }
-
-    impl Meta {
-        fn get() -> &'static Self {
-            static META: Lazy<Meta> = Lazy::new(|| {
-                let mut method_id = ActionId(0);
-                let mut builder = MetaObject::builder();
-                let add;
-                let sub;
-                let mul;
-                let div;
-                let clamp;
-                let ans;
-                builder
-                    .add_method({
-                        add = method_id.wrapping_next();
-                        let mut builder = MetaMethod::builder(add);
-                        builder.set_name("add");
-                        builder.parameter(0).set_type(Type::Int32);
-                        builder.return_value().set_type(Type::Int32);
-                        builder.build()
-                    })
-                    .add_method({
-                        sub = method_id.wrapping_next();
-                        let mut builder = MetaMethod::builder(sub);
-                        builder.set_name("sub");
-                        builder.parameter(0).set_type(Type::Int32);
-                        builder.build()
-                    })
-                    .add_method({
-                        mul = method_id.wrapping_next();
-                        let mut builder = MetaMethod::builder(mul);
-                        builder.set_name("mul");
-                        builder.parameter(0).set_type(Type::Int32);
-                        builder.build()
-                    })
-                    .add_method({
-                        div = method_id.wrapping_next();
-                        let mut builder = MetaMethod::builder(div);
-                        builder.set_name("div");
-                        builder.parameter(0).set_type(Type::Int32);
-                        builder.build()
-                    })
-                    .add_method({
-                        clamp = method_id.wrapping_next();
-                        let mut builder = MetaMethod::builder(clamp);
-                        builder.set_name("clamp");
-                        builder.parameter(0).set_type(Type::Int32);
-                        builder.parameter(1).set_type(Type::Int32);
-                        builder.build()
-                    })
-                    .add_method({
-                        ans = method_id.wrapping_next();
-                        let mut builder = MetaMethod::builder(ans);
-                        builder.set_name("ans");
-                        builder.build()
-                    });
-                let object = builder.build();
-                let methods = MethodIds {
-                    add,
-                    sub,
-                    mul,
-                    div,
-                    clamp,
-                    ans,
-                };
-                Meta { object, methods }
-            });
-            &META
-        }
-    }
-
-    #[derive(Debug)]
-    struct MethodIds {
-        add: ActionId,
-        sub: ActionId,
-        mul: ActionId,
-        div: ActionId,
-        clamp: ActionId,
-        ans: ActionId,
-    }
-
-    #[derive(Debug)]
-    enum Method {
-        Add,
-        Sub,
-        Mul,
-        Div,
-        Clamp,
-        Ans,
-    }
-
-    impl Method {
-        fn from_ident(ident: &MemberIdent) -> Option<Self> {
-            let Meta { object, methods } = Meta::get();
-            object.method(ident).and_then(|method| {
-                let id = method.uid;
-                if id == methods.add {
-                    Some(Method::Add)
-                } else if id == methods.sub {
-                    Some(Method::Sub)
-                } else if id == methods.mul {
-                    Some(Method::Mul)
-                } else if id == methods.div {
-                    Some(Method::Div)
-                } else if id == methods.clamp {
-                    Some(Method::Clamp)
-                } else if id == methods.ans {
-                    Some(Method::Ans)
-                } else {
-                    None
-                }
-            })
-        }
-
-        fn call(self, calc: &mut Calculator, args: Value<'_>) -> Result<Value<'static>, Error> {
-            Ok(match &self {
-                Self::Add => {
-                    let arg = args.cast_into().map_err(ValueConversionError::Arguments)?;
-                    calc.add(arg).into_value()
-                }
-                Self::Sub => {
-                    let arg = args.cast_into().map_err(ValueConversionError::Arguments)?;
-                    calc.sub(arg).into_value()
-                }
-                Self::Mul => {
-                    let arg = args.cast_into().map_err(ValueConversionError::Arguments)?;
-                    calc.mul(arg).into_value()
-                }
-                Self::Div => {
-                    let arg = args.cast_into().map_err(ValueConversionError::Arguments)?;
-                    calc.div(arg)
-                        .map_err(Into::into)
-                        .map_err(Error::Other)?
-                        .into_value()
-                }
-                Self::Clamp => {
-                    let (arg1, arg2) = args.cast_into().map_err(ValueConversionError::Arguments)?;
-                    calc.clamp(arg1, arg2).into_value()
-                }
-                Self::Ans => {
-                    let () = args.cast_into().map_err(ValueConversionError::Arguments)?;
-                    calc.ans().into_value()
-                }
-            })
+    impl From<DivisionByZeroError> for Error {
+        fn from(err: DivisionByZeroError) -> Self {
+            Self::Other(err.into())
         }
     }
 
     #[async_trait]
-    impl Object for Mutex<Calculator> {
-        fn meta(&self) -> &MetaObject {
-            &Meta::get().object
+    impl Calculator for Calc {
+        async fn go_to(&self, _position: i32) -> Result<(), Error> {
+            Ok(())
         }
 
-        async fn meta_call(
-            &self,
-            ident: MemberIdent,
-            args: Value<'_>,
-        ) -> Result<Value<'static>, Error> {
-            Method::from_ident(&ident)
-                .ok_or_else(|| Error::MethodNotFound(ident))?
-                .call(&mut *self.lock().await, args)
+        fn position(&self) -> i32 {
+            0
         }
 
-        async fn meta_post(&self, ident: MemberIdent, args: Value<'_>) {
-            let _res = self.meta_call(ident, args).await;
+        fn moving(&self) -> bool {
+            false
         }
 
-        async fn meta_event(&self, _ident: MemberIdent, _value: Value<'_>) {
-            // no signal
+        async fn add(&self, b: i32) -> i32 {
+            let mut a = self.a.lock().await;
+            *a += b;
+            *a
+        }
+
+        async fn sub(&self, b: i32) -> i32 {
+            let mut a = self.a.lock().await;
+            *a -= b;
+            *a
+        }
+
+        async fn mul(&self, b: i32) -> i32 {
+            let mut a = self.a.lock().await;
+            *a *= b;
+            *a
+        }
+
+        async fn div(&self, b: i32) -> std::result::Result<i32, DivisionByZeroError> {
+            let mut a = self.a.lock().await;
+            if b == 0 {
+                Err(DivisionByZeroError)
+            } else {
+                *a /= b;
+                Ok(*a)
+            }
+        }
+
+        async fn clamp(&self, min: i32, max: i32) -> i32 {
+            let mut a = self.a.lock().await;
+            *a = (*a).clamp(min, max);
+            *a
+        }
+
+        async fn ans(&self) -> i32 {
+            *self.a.lock().await
         }
     }
 
     #[tokio::test]
     async fn test_calculator_object_call_methods() {
-        let calc = Mutex::new(Calculator::new(42));
+        let calc = Calc::new(42);
         let res: i32 = calc.call("add", 100).await.unwrap();
         assert_eq!(res, 142);
         let res: i32 = calc.call("add", 50).await.unwrap();
@@ -645,32 +524,10 @@ mod tests {
         let res: i32 = calc.call("ans", ()).await.unwrap();
         assert_eq!(res, 127);
     }
-}
-
-#[cfg(test)]
-mod object_macro {
-    use super::{ActionId, MemberIdent, ACTION_START_ID};
-    use crate::value::Reflect;
-
-    #[allow(dead_code)]
-    #[qi::object]
-    trait Motion {
-        /// Go to some position.
-        #[qi::method(name = "goTo")]
-        async fn go_to(&self, position: i32) -> Result<(), String>;
-
-        /// The current position.
-        #[qi::property]
-        fn position(&self) -> i32;
-
-        /// The moving state.
-        #[qi::signal]
-        fn moving(&self) -> bool;
-    }
 
     #[test]
     fn emits_meta_object() {
-        let meta = &*MOTION_META_OBJECT;
+        let meta = &*CALCULATOR_META_OBJECT;
 
         let go_to = meta
             .method(&MemberIdent::from("goTo"))
