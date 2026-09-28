@@ -41,6 +41,9 @@
 #![doc(test(attr(deny(warnings))))]
 #![doc = include_str!("../README.md")]
 
+// Generated `::qi::…` paths from `#[qi::object]` resolve inside this crate.
+extern crate self as qi;
+
 mod error;
 pub mod node;
 pub mod object;

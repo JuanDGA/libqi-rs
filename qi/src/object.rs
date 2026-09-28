@@ -646,3 +646,52 @@ mod tests {
         assert_eq!(res, 127);
     }
 }
+
+#[cfg(test)]
+mod object_macro {
+    use super::{ActionId, MemberIdent, ACTION_START_ID};
+    use crate::value::Reflect;
+
+    #[allow(dead_code)]
+    #[qi::object]
+    trait Motion {
+        /// Go to some position.
+        #[qi::method(name = "goTo")]
+        async fn go_to(&self, position: i32) -> Result<(), String>;
+
+        /// The current position.
+        #[qi::property]
+        fn position(&self) -> i32;
+
+        /// The moving state.
+        #[qi::signal]
+        fn moving(&self) -> bool;
+    }
+
+    #[test]
+    fn emits_meta_object() {
+        let meta = &*MOTION_META_OBJECT;
+
+        let go_to = meta
+            .method(&MemberIdent::from("goTo"))
+            .expect("method goTo");
+        assert_eq!(go_to.uid, ACTION_START_ID);
+        assert_eq!(go_to.name, "goTo");
+        assert_eq!(go_to.description, "Go to some position.");
+        assert_eq!(go_to.parameters[0].name, "position");
+        assert_eq!(go_to.parameters_signature, <(i32,) as Reflect>::signature());
+        assert_eq!(go_to.return_signature, <() as Reflect>::signature());
+
+        let position = meta
+            .property(&MemberIdent::from("position"))
+            .expect("property position");
+        assert_eq!(position.uid, ActionId(101));
+        assert_eq!(position.signature, <i32 as Reflect>::signature());
+
+        let moving = meta
+            .signal(&MemberIdent::from("moving"))
+            .expect("signal moving");
+        assert_eq!(moving.uid, ActionId(102));
+        assert_eq!(moving.signature, <bool as Reflect>::signature());
+    }
+}

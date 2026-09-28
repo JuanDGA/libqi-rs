@@ -1,24 +1,38 @@
+use convert_case::{Case, Casing};
 use proc_macro2::TokenStream;
-use quote::ToTokens;
+use quote::{quote, ToTokens};
 use syn::{
     parse::{Parse, ParseStream},
-    AttrStyle, Attribute, Error, Expr, ExprLit, Ident, ItemTrait, Lit, LitStr, Meta, MetaNameValue,
-    Result, TraitItem, TraitItemFn,
+    AttrStyle, Attribute, Error, Expr, ExprLit, FnArg, Ident, ItemTrait, Lit, LitStr, Meta,
+    MetaNameValue, Pat, Result, ReturnType, TraitItem, TraitItemFn, Type,
 };
 
-#[derive(Debug)]
 pub(super) struct Object {
     trait_item: ItemTrait,
-    name: String,
-    methods: Vec<Method>,
-    signals: Vec<Signal>,
-    properties: Vec<Property>,
-    description: Vec<LitStr>,
+    members: Vec<Member>,
 }
 
 impl ToTokens for Object {
     fn to_tokens(&self, tokens: &mut TokenStream) {
-        self.trait_item.to_tokens(tokens)
+        self.trait_item.to_tokens(tokens);
+        self.meta_object().to_tokens(tokens);
+    }
+}
+
+impl Object {
+    fn meta_object(&self) -> TokenStream {
+        let vis = &self.trait_item.vis;
+        let ident = meta_object_ident(&self.trait_item.ident);
+        let members = self.members.iter().map(Member::to_add_tokens);
+        quote! {
+            #vis static #ident: ::once_cell::sync::Lazy<::qi::object::MetaObject> =
+                ::once_cell::sync::Lazy::new(|| {
+                    let mut builder = ::qi::object::MetaObject::builder();
+                    let mut action_id = ::qi::object::ACTION_START_ID;
+                    #(#members)*
+                    builder.build()
+                });
+        }
     }
 }
 
@@ -33,75 +47,130 @@ impl Parse for Object {
             ));
         }
 
-        let description = trait_item
-            .attrs
-            .iter()
-            .filter_map(attribute_outer_doc)
-            .collect();
-
-        let items_len = trait_item.items.len();
-        let mut methods = Vec::with_capacity(items_len);
-        let mut signals = Vec::with_capacity(items_len);
-        let mut properties = Vec::with_capacity(items_len);
-
+        let mut members = Vec::with_capacity(trait_item.items.len());
         for item in &mut trait_item.items {
             reject_unknown_qi_attrs(item_attrs(item))?;
             reject_tagged_non_fn(item)?;
             if let Some(method) = Method::from_item(item)? {
-                methods.push(method)
+                members.push(Member::Method(method));
             } else if let Some(signal) = Signal::from_item(item)? {
-                signals.push(signal)
+                members.push(Member::Signal(signal));
             } else if let Some(property) = Property::from_item(item)? {
-                properties.push(property)
+                members.push(Member::Property(property));
             }
             strip_qi_attrs(item);
         }
 
         Ok(Self {
-            name: trait_item.ident.to_string(),
             trait_item,
-            methods,
-            signals,
-            properties,
-            description,
+            members,
         })
     }
 }
 
-#[derive(Debug)]
+enum Member {
+    Method(Method),
+    Signal(Signal),
+    Property(Property),
+}
+
+impl Member {
+    fn to_add_tokens(&self) -> TokenStream {
+        match self {
+            Self::Method(method) => method.to_add_tokens(),
+            Self::Signal(signal) => signal.to_add_tokens(),
+            Self::Property(property) => property.to_add_tokens(),
+        }
+    }
+}
+
 struct Method {
     func: TraitItemFn,
+    name: String,
 }
 
 impl Method {
     fn from_item(item: &TraitItem) -> Result<Option<Self>> {
-        tagged_fn(item, "qi::method").map(|func| func.map(|func| Self { func }))
+        tagged_fn(item, "qi::method").map(|tagged| tagged.map(|(func, name)| Self { func, name }))
+    }
+
+    fn to_add_tokens(&self) -> TokenStream {
+        let name = &self.name;
+        let description = member_docs(&self.func);
+        let set_description = description.map(|description| {
+            quote! {
+                method.set_description(#description);
+            }
+        });
+        let parameters = method_parameters(&self.func);
+        let return_ty = method_return_type(&self.func);
+        quote! {
+            builder.add_method({
+                let uid = action_id.wrapping_next();
+                let mut method = ::qi::object::MetaMethod::builder(uid);
+                method.set_name(#name);
+                #set_description
+                #parameters
+                method.return_value().set_type(<#return_ty as ::qi::value::Reflect>::ty());
+                method.build()
+            });
+        }
     }
 }
 
-#[derive(Debug)]
 struct Signal {
     func: TraitItemFn,
+    name: String,
 }
 
 impl Signal {
     fn from_item(item: &TraitItem) -> Result<Option<Self>> {
-        tagged_fn(item, "qi::signal").map(|func| func.map(|func| Self { func }))
+        tagged_fn(item, "qi::signal").map(|tagged| tagged.map(|(func, name)| Self { func, name }))
+    }
+
+    fn to_add_tokens(&self) -> TokenStream {
+        let name = &self.name;
+        let ty = payload_type(&self.func);
+        quote! {
+            builder.add_signal({
+                let uid = action_id.wrapping_next();
+                ::qi::object::MetaSignal {
+                    uid,
+                    name: ::std::string::String::from(#name),
+                    signature: <#ty as ::qi::value::Reflect>::signature(),
+                }
+            });
+        }
     }
 }
 
-#[derive(Debug)]
 struct Property {
     func: TraitItemFn,
+    name: String,
 }
 
 impl Property {
     fn from_item(item: &TraitItem) -> Result<Option<Self>> {
-        tagged_fn(item, "qi::property").map(|func| func.map(|func| Self { func }))
+        tagged_fn(item, "qi::property").map(|tagged| tagged.map(|(func, name)| Self { func, name }))
+    }
+
+    fn to_add_tokens(&self) -> TokenStream {
+        let name = &self.name;
+        let ty = payload_type(&self.func);
+        quote! {
+            builder.add_property({
+                let uid = action_id.wrapping_next();
+                ::qi::object::MetaProperty {
+                    uid,
+                    name: ::std::string::String::from(#name),
+                    signature: <#ty as ::qi::value::Reflect>::signature(),
+                }
+            });
+        }
     }
 }
 
-fn tagged_fn(item: &TraitItem, tag: &str) -> Result<Option<TraitItemFn>> {
+fn tagged_fn(item: &TraitItem, tag: &str) -> Result<Option<(TraitItemFn, String)>> {
     let func = match item {
         TraitItem::Fn(f) => f,
         _ => return Ok(None),
@@ -113,9 +182,9 @@ fn tagged_fn(item: &TraitItem, tag: &str) -> Result<Option<TraitItemFn>> {
     else {
         return Ok(None);
     };
-    parse_name_arg(attr, tag)?;
+    let name = parse_name_arg(attr, tag)?.unwrap_or_else(|| func.sig.ident.to_string());
     require_ref_self(func, tag)?;
-    Ok(Some(func.clone()))
+    Ok(Some((func.clone(), name)))
 }
 
 fn require_ref_self(func: &TraitItemFn, tag: &str) -> Result<()> {
@@ -136,9 +205,9 @@ fn require_ref_self(func: &TraitItemFn, tag: &str) -> Result<()> {
     }
 }
 
-fn parse_name_arg(attr: &Attribute, tag: &str) -> Result<()> {
+fn parse_name_arg(attr: &Attribute, tag: &str) -> Result<Option<String>> {
     match &attr.meta {
-        Meta::Path(_) => Ok(()),
+        Meta::Path(_) => Ok(None),
         Meta::List(_) => attr.parse_args_with(|input: ParseStream| {
             let key: Ident = input.parse()?;
             if key != "name" {
@@ -149,7 +218,7 @@ fn parse_name_arg(attr: &Attribute, tag: &str) -> Result<()> {
             }
             input.parse::<syn::Token![=]>()?;
             match input.parse::<Lit>()? {
-                Lit::Str(_) => Ok(()),
+                Lit::Str(s) => Ok(Some(s.value())),
                 other => Err(Error::new_spanned(other, "`name` must be a string literal")),
             }
         }),
@@ -245,4 +314,93 @@ fn attribute_outer_doc(attr: &Attribute) -> Option<LitStr> {
 
 fn is_member_tag_attribute(attr: &Attribute, ty: &str) -> bool {
     qi_leaf(attr).is_some_and(|leaf| leaf == ty)
+}
+
+fn meta_object_ident(trait_name: &Ident) -> Ident {
+    Ident::new(
+        &format!(
+            "{}_META_OBJECT",
+            trait_name.to_string().to_case(Case::UpperSnake)
+        ),
+        trait_name.span(),
+    )
+}
+
+fn member_docs(func: &TraitItemFn) -> Option<String> {
+    let docs: Vec<String> = func
+        .attrs
+        .iter()
+        .filter_map(attribute_outer_doc)
+        .map(|doc| {
+            let value = doc.value();
+            value.strip_prefix(' ').unwrap_or(&value).to_owned()
+        })
+        .collect();
+    if docs.is_empty() {
+        None
+    } else {
+        Some(docs.join("\n"))
+    }
+}
+
+fn method_parameters(func: &TraitItemFn) -> TokenStream {
+    let parameters = func.sig.inputs.iter().filter_map(|input| match input {
+        FnArg::Typed(typed) => Some(typed),
+        _ => None,
+    });
+    let statements = parameters.enumerate().map(|(index, typed)| {
+        let ty = &typed.ty;
+        let set_name = match &*typed.pat {
+            Pat::Ident(pat) => {
+                let name = pat.ident.to_string();
+                Some(quote! {
+                    method.parameter(#index).set_name(#name);
+                })
+            }
+            _ => None,
+        };
+        quote! {
+            #set_name
+            method.parameter(#index).set_type(<#ty as ::qi::value::Reflect>::ty());
+        }
+    });
+    quote! {
+        #(#statements)*
+    }
+}
+
+fn method_return_type(func: &TraitItemFn) -> TokenStream {
+    match &func.sig.output {
+        ReturnType::Default => quote!(()),
+        ReturnType::Type(_, ty) => {
+            let ty = unwrap_result(ty);
+            quote!(#ty)
+        }
+    }
+}
+
+fn payload_type(func: &TraitItemFn) -> TokenStream {
+    match &func.sig.output {
+        ReturnType::Default => quote!(()),
+        ReturnType::Type(_, ty) => quote!(#ty),
+    }
+}
+
+fn unwrap_result(ty: &Type) -> &Type {
+    let Type::Path(path) = ty else {
+        return ty;
+    };
+    let Some(last) = path.path.segments.last() else {
+        return ty;
+    };
+    if last.ident != "Result" {
+        return ty;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &last.arguments else {
+        return ty;
+    };
+    match args.args.first() {
+        Some(syn::GenericArgument::Type(inner)) => inner,
+        _ => ty,
+    }
 }

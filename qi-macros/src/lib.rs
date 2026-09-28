@@ -48,17 +48,13 @@ pub fn proc_macro_derive_from_value(input: TokenStream) -> TokenStream {
 
 /// Declares an object type.
 ///
-/// Checks `#[qi::method]`, `#[qi::property]`, and `#[qi::signal]` members
-/// and emits the trait with those attributes removed.
+/// Checks `#[qi::method]`, `#[qi::property]`, and `#[qi::signal]` members,
+/// emits the trait with those attributes removed, and defines
+/// `<TRAIT>_META_OBJECT` as `once_cell::sync::Lazy<qi::object::MetaObject>`.
 ///
 /// # Example
 ///
-/// ```
-/// # mod qi {
-/// #   pub(super) use qi_macros::object;
-/// # }
-/// # struct Position;
-/// # struct Error;
+/// ```ignore
 /// #[qi::object]
 /// trait Motion {
 ///     /// Go to some position.
