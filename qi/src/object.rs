@@ -17,8 +17,8 @@ pub use value::object::{Uid, *};
 // const ACTION_ID_UNREGISTER_EVENT: ActionId = ActionId(1);
 const ACTION_ID_METAOBJECT: ActionId = ActionId(2);
 // const ACTION_ID_TERMINATE: ActionId = ActionId(3);
-const ACTION_ID_PROPERTY: ActionId = ActionId(5); // not a typo, there is no action 4
-const ACTION_ID_SET_PROPERTY: ActionId = ActionId(6);
+pub const ACTION_ID_PROPERTY: ActionId = ActionId(5); // not a typo, there is no action 4
+pub const ACTION_ID_SET_PROPERTY: ActionId = ActionId(6);
 // const ACTION_ID_PROPERTIES: ActionId = ActionId(7);
 // const ACTION_ID_REGISTER_EVENT_WITH_SIGNATURE: ActionId = ActionId(8);
 pub const ACTION_START_ID: ActionId = ActionId(100);
@@ -398,11 +398,11 @@ mod tests {
 
         /// The current position.
         #[qi::property]
-        fn position(&self) -> i32;
+        fn position(&self) -> crate::Property<i32>;
 
         /// The moving state.
         #[qi::signal]
-        fn moving(&self) -> bool;
+        fn moving(&self) -> crate::Signal<bool>;
 
         #[qi::method]
         async fn add(&self, b: i32) -> i32;
@@ -423,14 +423,19 @@ mod tests {
         async fn ans(&self) -> i32;
     }
 
-    #[derive(Debug)]
     struct Calc {
         a: Mutex<i32>,
+        position: crate::Property<i32>,
+        moving: crate::Signal<bool>,
     }
 
     impl Calc {
         fn new(a: i32) -> Self {
-            Self { a: Mutex::new(a) }
+            Self {
+                a: Mutex::new(a),
+                position: crate::Property::new(0),
+                moving: crate::Signal::new(),
+            }
         }
     }
 
@@ -450,12 +455,12 @@ mod tests {
             Ok(())
         }
 
-        fn position(&self) -> i32 {
-            0
+        fn position(&self) -> crate::Property<i32> {
+            self.position.clone()
         }
 
-        fn moving(&self) -> bool {
-            false
+        fn moving(&self) -> crate::Signal<bool> {
+            self.moving.clone()
         }
 
         async fn add(&self, b: i32) -> i32 {
@@ -523,6 +528,32 @@ mod tests {
         );
         let res: i32 = calc.call("ans", ()).await.unwrap();
         assert_eq!(res, 127);
+    }
+
+    #[tokio::test]
+    async fn property_set_emits_and_signal_event_reaches_subscriber() {
+        let calc = Calc::new(0);
+        let property_updates = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let property_slot = std::sync::Arc::clone(&property_updates);
+        calc.position().subscribe(move |value| {
+            *property_slot.lock().unwrap() = Some(value);
+        });
+        let signal_updates = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let signal_slot = std::sync::Arc::clone(&signal_updates);
+        calc.moving().subscribe(move |value| {
+            *signal_slot.lock().unwrap() = Some(value);
+        });
+
+        let position: i32 = calc.property("position").await.unwrap();
+        assert_eq!(position, 0);
+        calc.set_property("position", 4).await.unwrap();
+        let position: i32 = calc.property("position").await.unwrap();
+        assert_eq!(position, 4);
+        assert_eq!(*property_updates.lock().unwrap(), Some(4));
+
+        calc.meta_event(MemberIdent::from("moving"), true.into_value())
+            .await;
+        assert_eq!(*signal_updates.lock().unwrap(), Some(true));
     }
 
     #[test]

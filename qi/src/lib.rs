@@ -47,6 +47,7 @@ extern crate self as qi;
 mod error;
 pub mod node;
 pub mod object;
+mod property;
 pub mod service;
 pub(crate) mod service_directory;
 pub(crate) mod session;
@@ -57,8 +58,10 @@ pub use self::{
     error::{BoxError, Error, HandlerError},
     node::Node,
     object::{Object, ObjectExt},
+    property::Property,
     service_directory::ServiceDirectory,
     session::auth,
+    signal::Signal,
     value::Value,
 };
 pub use qi_format as format;

@@ -64,11 +64,11 @@ pub fn proc_macro_derive_from_value(input: TokenStream) -> TokenStream {
 ///
 ///     /// The current position.
 ///     #[qi::property]
-///     fn position(&self) -> Position;
+///     fn position(&self) -> qi::Property<Position>;
 ///
 ///     /// The moving state.
 ///     #[qi::signal]
-///     fn moving(&self) -> bool;
+///     fn moving(&self) -> qi::Signal<bool>;
 /// }
 /// ```
 #[proc_macro_attribute]

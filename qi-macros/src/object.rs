@@ -49,6 +49,18 @@ impl Object {
             Member::Method(method) => Some(method.to_call_arm()),
             Member::Signal(_) | Member::Property(_) => None,
         });
+        let property_get_arms = self.members.iter().filter_map(|member| match member {
+            Member::Property(property) => Some(property.to_get_arm()),
+            Member::Method(_) | Member::Signal(_) => None,
+        });
+        let property_set_arms = self.members.iter().filter_map(|member| match member {
+            Member::Property(property) => Some(property.to_set_arm()),
+            Member::Method(_) | Member::Signal(_) => None,
+        });
+        let signal_arms = self.members.iter().filter_map(|member| match member {
+            Member::Signal(signal) => Some(signal.to_event_arm()),
+            Member::Method(_) | Member::Property(_) => None,
+        });
         quote! {
             #[::async_trait::async_trait]
             impl<T> ::qi::Object for T
@@ -64,6 +76,44 @@ impl Object {
                     ident: ::qi::object::MemberIdent,
                     args: ::qi::Value<'_>,
                 ) -> ::std::result::Result<::qi::Value<'static>, ::qi::Error> {
+                    if ident == ::qi::object::MemberIdent::Id(::qi::object::ACTION_ID_PROPERTY) {
+                        let prop_ident: ::qi::value::Dynamic<::qi::object::MemberIdent> = args
+                            .cast_into()
+                            .map_err(|err| ::qi::Error::from(::qi::BoxError::from(err)))?;
+                        let prop_ident = prop_ident.into_inner();
+                        let property = #meta_ident.property(&prop_ident).ok_or_else(|| {
+                            ::qi::Error::MethodNotFound(prop_ident)
+                        })?;
+                        return match property.name.as_str() {
+                            #(#property_get_arms)*
+                            _ => ::std::result::Result::Err(::qi::Error::MethodNotFound(
+                                ::qi::object::MemberIdent::from(property.name.clone()),
+                            )),
+                        };
+                    }
+                    if ident == ::qi::object::MemberIdent::Id(::qi::object::ACTION_ID_SET_PROPERTY)
+                    {
+                        let (prop_ident, raw_value): (
+                            ::qi::value::Dynamic<::qi::object::MemberIdent>,
+                            ::qi::value::Dynamic<::qi::Value<'_>>,
+                        ) = args
+                            .cast_into()
+                            .map_err(|err| ::qi::Error::from(::qi::BoxError::from(err)))?;
+                        let prop_ident = prop_ident.into_inner();
+                        let raw_value = raw_value.into_inner();
+                        let property = #meta_ident.property(&prop_ident).ok_or_else(|| {
+                            ::qi::Error::MethodNotFound(prop_ident)
+                        })?;
+                        return match property.name.as_str() {
+                            #(#property_set_arms)*
+                            _ => {
+                                let _ = raw_value;
+                                ::std::result::Result::Err(::qi::Error::MethodNotFound(
+                                    ::qi::object::MemberIdent::from(property.name.clone()),
+                                ))
+                            }
+                        };
+                    }
                     let method = #meta_ident
                         .method(&ident)
                         .ok_or_else(|| ::qi::Error::MethodNotFound(ident))?;
@@ -88,9 +138,18 @@ impl Object {
 
                 async fn meta_event(
                     &self,
-                    _ident: ::qi::object::MemberIdent,
-                    _value: ::qi::Value<'_>,
+                    ident: ::qi::object::MemberIdent,
+                    value: ::qi::Value<'_>,
                 ) {
+                    let Some(signal) = #meta_ident.signal(&ident) else {
+                        return;
+                    };
+                    match signal.name.as_str() {
+                        #(#signal_arms)*
+                        _ => {
+                            let _ = value;
+                        }
+                    }
                 }
             }
         }
@@ -236,6 +295,21 @@ impl Signal {
             });
         }
     }
+
+    fn to_event_arm(&self) -> TokenStream {
+        let name = &self.name;
+        let call = handle_call(&self.func);
+        let ty = payload_type(&self.func);
+        quote! {
+            #name => {
+                if let ::std::result::Result::Ok(value) =
+                    ::qi::value::Value::cast_into::<#ty>(value)
+                {
+                    #call.emit(value);
+                }
+            }
+        }
+    }
 }
 
 struct Property {
@@ -261,6 +335,39 @@ impl Property {
                 }
             });
         }
+    }
+
+    fn to_get_arm(&self) -> TokenStream {
+        let name = &self.name;
+        let call = handle_call(&self.func);
+        quote! {
+            #name => {
+                ::std::result::Result::Ok(::qi::value::IntoValue::into_value(#call.get()))
+            }
+        }
+    }
+
+    fn to_set_arm(&self) -> TokenStream {
+        let name = &self.name;
+        let call = handle_call(&self.func);
+        let ty = payload_type(&self.func);
+        quote! {
+            #name => {
+                let value: #ty = ::qi::value::Value::cast_into(raw_value)
+                    .map_err(|err| ::qi::Error::from(::qi::BoxError::from(err)))?;
+                #call.set(value);
+                ::std::result::Result::Ok(::qi::value::IntoValue::into_value(()))
+            }
+        }
+    }
+}
+
+fn handle_call(func: &TraitItemFn) -> TokenStream {
+    let ident = &func.sig.ident;
+    if func.sig.asyncness.is_some() {
+        quote!(self.#ident().await)
+    } else {
+        quote!(self.#ident())
     }
 }
 
@@ -476,7 +583,30 @@ fn method_return_type(func: &TraitItemFn) -> TokenStream {
 fn payload_type(func: &TraitItemFn) -> TokenStream {
     match &func.sig.output {
         ReturnType::Default => quote!(()),
-        ReturnType::Type(_, ty) => quote!(#ty),
+        ReturnType::Type(_, ty) => {
+            let ty = unwrap_handle(ty);
+            quote!(#ty)
+        }
+    }
+}
+
+/// `Property<T>` and `Signal<T>` describe `T` on the wire.
+fn unwrap_handle(ty: &Type) -> &Type {
+    let Type::Path(path) = ty else {
+        return ty;
+    };
+    let Some(last) = path.path.segments.last() else {
+        return ty;
+    };
+    if last.ident != "Property" && last.ident != "Signal" {
+        return ty;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &last.arguments else {
+        return ty;
+    };
+    match args.args.first() {
+        Some(syn::GenericArgument::Type(inner)) => inner,
+        _ => ty,
     }
 }
 
