@@ -1,14 +1,16 @@
 use std::sync::{Arc, Mutex};
 
-use crate::signal::Signal;
+use crate::{object::ObjectClient, signal::Signal};
 
 enum PropertyKind<T> {
     Local {
         value: Arc<Mutex<T>>,
         signal: Signal<T>,
     },
-    #[allow(dead_code)]
-    Remote,
+    Remote {
+        client: ObjectClient,
+        name: String,
+    },
 }
 
 pub struct Property<T> {
@@ -23,7 +25,10 @@ impl<T> Clone for Property<T> {
                     value: Arc::clone(value),
                     signal: signal.clone(),
                 },
-                PropertyKind::Remote => PropertyKind::Remote,
+                PropertyKind::Remote { client, name } => PropertyKind::Remote {
+                    client: client.clone(),
+                    name: name.clone(),
+                },
             },
         }
     }
@@ -39,10 +44,21 @@ impl<T: Clone> Property<T> {
         }
     }
 
+    pub fn remote(client: ObjectClient, name: impl Into<String>) -> Self {
+        Self {
+            kind: PropertyKind::Remote {
+                client,
+                name: name.into(),
+            },
+        }
+    }
+
     pub fn get(&self) -> T {
         match &self.kind {
             PropertyKind::Local { value, .. } => value.lock().unwrap().clone(),
-            PropertyKind::Remote => unreachable!("remote property handles are not constructed"),
+            PropertyKind::Remote { .. } => {
+                unreachable!("remote property reads go through the object client")
+            }
         }
     }
 

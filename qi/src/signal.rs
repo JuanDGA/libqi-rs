@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
 
+use crate::object::ObjectClient;
 use qi_value::{ActionId, Value};
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, qi_macros::Valuable)]
@@ -16,8 +17,7 @@ type Listener<T> = Arc<dyn Fn(T) + Send + Sync>;
 
 enum SignalKind<T> {
     Local(Arc<Mutex<Vec<Listener<T>>>>),
-    #[allow(dead_code)]
-    Remote,
+    Remote { client: ObjectClient, name: String },
 }
 
 pub struct Signal<T> {
@@ -29,7 +29,10 @@ impl<T> Clone for Signal<T> {
         Self {
             kind: match &self.kind {
                 SignalKind::Local(listeners) => SignalKind::Local(Arc::clone(listeners)),
-                SignalKind::Remote => SignalKind::Remote,
+                SignalKind::Remote { client, name } => SignalKind::Remote {
+                    client: client.clone(),
+                    name: name.clone(),
+                },
             },
         }
     }
@@ -45,6 +48,15 @@ impl<T: Clone> Signal<T> {
     pub fn new() -> Self {
         Self {
             kind: SignalKind::Local(Arc::new(Mutex::new(Vec::new()))),
+        }
+    }
+
+    pub fn remote(client: ObjectClient, name: impl Into<String>) -> Self {
+        Self {
+            kind: SignalKind::Remote {
+                client,
+                name: name.into(),
+            },
         }
     }
 

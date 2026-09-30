@@ -23,11 +23,11 @@ pub trait ServiceDirectory: Object {
     async fn update_service_info(&self, info: &service::Info) -> Result<(), Error>;
 }
 
-pub struct Client(object::Proxy);
+pub struct Client(object::ObjectClient);
 
 impl Client {
     pub(super) fn new(session: session::Session) -> Self {
-        Self(object::Proxy::new(
+        Self(object::ObjectClient::new(
             SERVICE_ID,
             service::MAIN_OBJECT_ID,
             object::Uid::default(),

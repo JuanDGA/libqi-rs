@@ -236,7 +236,7 @@ where
                 Default::default(),
             )
             .await?;
-        let object = object::Proxy::connect(
+        let object = object::ObjectClient::connect(
             service.id(),
             service::MAIN_OBJECT_ID,
             service.object_uid(),

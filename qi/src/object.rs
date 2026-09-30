@@ -23,6 +23,13 @@ pub const ACTION_ID_SET_PROPERTY: ActionId = ActionId(6);
 // const ACTION_ID_REGISTER_EVENT_WITH_SIGNATURE: ActionId = ActionId(8);
 pub const ACTION_START_ID: ActionId = ActionId(100);
 
+pub fn block_on<F>(future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    tokio::runtime::Handle::current().block_on(future)
+}
+
 pub(crate) struct BoxObject(Box<dyn Object + Send + Sync>);
 
 impl BoxObject {
@@ -123,7 +130,7 @@ pub trait ObjectExt: Object {
 #[async_trait]
 impl<O> ObjectExt for O where O: Object + Sync + ?Sized {}
 
-pub struct Proxy {
+pub struct ObjectClient {
     service_id: ServiceId,
     id: Id,
     uid: Uid,
@@ -131,7 +138,7 @@ pub struct Proxy {
     session: Session,
 }
 
-impl Proxy {
+impl ObjectClient {
     pub(super) fn new(
         service_id: ServiceId,
         id: Id,
@@ -181,9 +188,28 @@ impl Proxy {
             .cast_into()
             .map_err(ValueConversionError::MethodReturnValue)?)
     }
+
+    fn builtin_return_type(
+        &self,
+        action: ActionId,
+        args: &Value<'_>,
+    ) -> Result<Option<value::Type>, Error> {
+        if action == ACTION_ID_SET_PROPERTY {
+            return Ok(<() as value::Reflect>::signature().into_type());
+        }
+        let prop_ident: Dynamic<MemberIdent> = args
+            .clone()
+            .cast_into()
+            .map_err(|err| Error::from(crate::BoxError::from(err)))?;
+        let property = self
+            .meta
+            .property(&prop_ident.0)
+            .ok_or_else(|| Error::MethodNotFound(prop_ident.0))?;
+        Ok(property.signature.clone().into_type())
+    }
 }
 
-impl Clone for Proxy {
+impl Clone for ObjectClient {
     fn clone(&self) -> Self {
         Self {
             service_id: self.service_id,
@@ -195,9 +221,9 @@ impl Clone for Proxy {
     }
 }
 
-impl std::fmt::Debug for Proxy {
+impl std::fmt::Debug for ObjectClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Proxy")
+        f.debug_struct("ObjectClient")
             .field("service_id", &self.service_id)
             .field("id", &self.id)
             .field("uid", &self.uid)
@@ -208,7 +234,7 @@ impl std::fmt::Debug for Proxy {
 }
 
 #[async_trait]
-impl Object for Proxy {
+impl Object for ObjectClient {
     fn meta(&self) -> &MetaObject {
         &self.meta
     }
@@ -218,6 +244,17 @@ impl Object for Proxy {
         ident: MemberIdent,
         args: Value<'_>,
     ) -> Result<Value<'static>, Error> {
+        if let MemberIdent::Id(action @ (ACTION_ID_PROPERTY | ACTION_ID_SET_PROPERTY)) = ident {
+            let return_type = self.builtin_return_type(action, &args)?;
+            return self
+                .session
+                .call(
+                    message::Address(self.service_id, self.id, action),
+                    args,
+                    return_type.as_ref(),
+                )
+                .await;
+        }
         let method = self
             .meta
             .method(&ident)
@@ -324,6 +361,12 @@ pub(super) trait HandlerExt: Object {
     async fn handler_meta_call(&self, action: ActionId, args: Bytes) -> Result<Bytes, Error> {
         // Get the targeted method so that we can get the expected parameters type and know what
         // type of value we're supposed to deserialize.
+        if action == ACTION_ID_METAOBJECT {
+            let reply = self.meta().clone().into_value();
+            return Ok(
+                format::to_bytes(&reply).map_err(FormatError::MethodReturnValueSerialization)?
+            );
+        }
         let action_ident = MemberIdent::Id(action);
         let method = self
             .meta()
@@ -331,7 +374,7 @@ pub(super) trait HandlerExt: Object {
             .ok_or_else(|| Error::MethodNotFound(action_ident.clone()))?;
         let args = value::deserialize(method.parameters_signature.to_type(), &args)
             .map_err(FormatError::ArgumentsDeserialization)?;
-        let reply = self.meta_call(action_ident, args).await?;
+        let reply = self.meta_call(action_ident, call_arguments(args)).await?;
         Ok(format::to_bytes(&reply).map_err(FormatError::MethodReturnValueSerialization)?)
     }
 
@@ -381,12 +424,26 @@ pub(super) trait HandlerExt: Object {
 
 impl<O> HandlerExt for O where O: Object + Sync + ?Sized {}
 
+/// Wire parameters are a tuple. Dispatch matches a local call: `()` , one value, or the tuple.
+fn call_arguments(value: Value<'_>) -> Value<'_> {
+    match value {
+        Value::Tuple(mut elements) if elements.len() == 1 => elements.pop().unwrap(),
+        Value::Tuple(elements) if elements.is_empty() => {
+            let _ = elements;
+            Value::Unit
+        }
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::value::Reflect;
     use assert_matches::assert_matches;
     use async_trait::async_trait;
+    use futures::FutureExt;
+    use std::sync::Arc;
     use tokio::sync::Mutex;
 
     #[allow(dead_code)]
@@ -446,6 +503,12 @@ mod tests {
     impl From<DivisionByZeroError> for Error {
         fn from(err: DivisionByZeroError) -> Self {
             Self::Other(err.into())
+        }
+    }
+
+    impl From<Error> for DivisionByZeroError {
+        fn from(_err: Error) -> Self {
+            Self
         }
     }
 
@@ -581,5 +644,124 @@ mod tests {
             .expect("signal moving");
         assert_eq!(moving.uid, ActionId(102));
         assert_eq!(moving.signature, <bool as Reflect>::signature());
+    }
+
+    #[tokio::test]
+    async fn client_rejects_meta_object_missing_go_to() {
+        let (_server, session) = host(Arc::new(Calc::new(0))).await;
+        let mut meta = CALCULATOR_META_OBJECT.clone();
+        let go_to = meta
+            .method(&MemberIdent::from("goTo"))
+            .expect("method goTo")
+            .uid;
+        meta.methods.retain(|id, _| *id != go_to);
+        let client = ObjectClient::new(ServiceId(2), Id(1), Uid::default(), meta, session);
+        let err = CalculatorClient::try_from(client).unwrap_err();
+        assert_matches!(err, Error::MethodNotFound(ident) => assert_eq!(ident, "goTo"));
+    }
+
+    #[tokio::test]
+    async fn client_calls_method_over_localhost() {
+        let calc = Arc::new(Calc::new(42));
+        let (_server, session) = host(Arc::clone(&calc)).await;
+        let client = ObjectClient::connect(ServiceId(2), Id(1), Uid::default(), session)
+            .await
+            .unwrap();
+        let client = CalculatorClient::try_from(client).unwrap();
+        let sum: i32 = client.add(100).await;
+        assert_eq!(sum, 142);
+    }
+
+    async fn host(calc: Arc<Calc>) -> (crate::session::Server, crate::session::Session) {
+        let mut server = crate::session::Session::server(
+            "tcp://127.0.0.1:0".parse().unwrap(),
+            crate::session::auth::PermissiveAuthenticator,
+            Host(calc),
+        )
+        .await
+        .unwrap();
+        let address = server.endpoints_receiver().borrow().0;
+        let (incoming, outgoing) = crate::messaging::channel::connect(address).await.unwrap();
+        let session =
+            crate::session::Session::connect(incoming, outgoing, Default::default(), Idle)
+                .await
+                .unwrap();
+        (server, session)
+    }
+
+    #[derive(Clone)]
+    struct Host(Arc<Calc>);
+
+    impl crate::messaging::CallHandler for Host {
+        type Error = crate::HandlerError;
+        type Future = futures::future::BoxFuture<'static, Result<bytes::Bytes, Self::Error>>;
+
+        fn handle_call(
+            &self,
+            address: crate::messaging::message::Address,
+            args: bytes::Bytes,
+        ) -> Self::Future {
+            let object = Arc::clone(&self.0);
+            async move {
+                if address.service() != ServiceId(2) || address.object() != Id(1) {
+                    return Err(crate::HandlerError::non_fatal("no handler"));
+                }
+                object
+                    .handler_meta_call(address.action(), args)
+                    .await
+                    .map_err(crate::HandlerError::non_fatal)
+            }
+            .boxed()
+        }
+    }
+
+    impl crate::messaging::EventHandler for Host {
+        fn handle_event(&self, _address: crate::messaging::message::Address, _args: bytes::Bytes) {}
+    }
+
+    impl crate::messaging::PostHandler for Host {
+        fn handle_post(&self, _address: crate::messaging::message::Address, _args: bytes::Bytes) {}
+    }
+
+    impl crate::messaging::CapabilitiesHandler for Host {
+        fn handle_capabilities(
+            &self,
+            _address: crate::messaging::message::Address,
+            _data: crate::value::KeyDynValueMap,
+        ) {
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct Idle;
+
+    impl crate::messaging::CallHandler for Idle {
+        type Error = crate::HandlerError;
+        type Future = futures::future::Ready<Result<bytes::Bytes, Self::Error>>;
+
+        fn handle_call(
+            &self,
+            _address: crate::messaging::message::Address,
+            _args: bytes::Bytes,
+        ) -> Self::Future {
+            futures::future::ready(Err(crate::HandlerError::non_fatal("no handler")))
+        }
+    }
+
+    impl crate::messaging::EventHandler for Idle {
+        fn handle_event(&self, _address: crate::messaging::message::Address, _args: bytes::Bytes) {}
+    }
+
+    impl crate::messaging::PostHandler for Idle {
+        fn handle_post(&self, _address: crate::messaging::message::Address, _args: bytes::Bytes) {}
+    }
+
+    impl crate::messaging::CapabilitiesHandler for Idle {
+        fn handle_capabilities(
+            &self,
+            _address: crate::messaging::message::Address,
+            _data: crate::value::KeyDynValueMap,
+        ) {
+        }
     }
 }

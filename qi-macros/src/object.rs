@@ -21,6 +21,7 @@ impl ToTokens for Object {
         });
         self.meta_object().to_tokens(tokens);
         self.object_impl().to_tokens(tokens);
+        self.client_impl().to_tokens(tokens);
     }
 }
 
@@ -154,6 +155,37 @@ impl Object {
             }
         }
     }
+
+    fn client_impl(&self) -> TokenStream {
+        let vis = &self.trait_item.vis;
+        let trait_ident = &self.trait_item.ident;
+        let client_ident = client_ident(trait_ident);
+        let checks = self.members.iter().map(Member::to_check_tokens);
+        let items = self.members.iter().map(Member::to_client_item);
+        quote! {
+            #[derive(Clone, Debug)]
+            #vis struct #client_ident {
+                client: ::qi::ObjectClient,
+            }
+
+            impl ::std::convert::TryFrom<::qi::ObjectClient> for #client_ident {
+                type Error = ::qi::Error;
+
+                fn try_from(
+                    client: ::qi::ObjectClient,
+                ) -> ::std::result::Result<Self, ::qi::Error> {
+                    let meta = client.meta();
+                    #(#checks)*
+                    ::std::result::Result::Ok(Self { client })
+                }
+            }
+
+            #[::async_trait::async_trait]
+            impl #trait_ident for #client_ident {
+                #(#items)*
+            }
+        }
+    }
 }
 
 impl Parse for Object {
@@ -200,6 +232,22 @@ impl Member {
             Self::Method(method) => method.to_add_tokens(),
             Self::Signal(signal) => signal.to_add_tokens(),
             Self::Property(property) => property.to_add_tokens(),
+        }
+    }
+
+    fn to_check_tokens(&self) -> TokenStream {
+        match self {
+            Self::Method(method) => method.to_check_tokens(),
+            Self::Signal(signal) => signal.to_check_tokens(),
+            Self::Property(property) => property.to_check_tokens(),
+        }
+    }
+
+    fn to_client_item(&self) -> TokenStream {
+        match self {
+            Self::Method(method) => method.to_client_item(),
+            Self::Signal(signal) => signal.to_client_item(),
+            Self::Property(property) => property.to_client_item(),
         }
     }
 }
@@ -269,6 +317,60 @@ impl Method {
             }
         }
     }
+
+    fn to_check_tokens(&self) -> TokenStream {
+        let name = &self.name;
+        let parameters = parameters_signature(&self.func);
+        let return_ty = method_return_type(&self.func);
+        let mismatch = meta_mismatch(name);
+        quote! {
+            {
+                let ident = ::qi::object::MemberIdent::from(#name);
+                let method = meta.method(&ident).ok_or_else(|| {
+                    ::qi::Error::MethodNotFound(ident)
+                })?;
+                if method.parameters_signature != #parameters
+                    || method.return_signature != <#return_ty as ::qi::value::Reflect>::signature()
+                {
+                    return ::std::result::Result::Err(#mismatch);
+                }
+            }
+        }
+    }
+
+    fn to_client_item(&self) -> TokenStream {
+        let sig = &self.func.sig;
+        let name = &self.name;
+        let arg_idents = method_arg_idents(&self.func);
+        let call_args = match arg_idents.len() {
+            0 => quote!(()),
+            1 => {
+                let arg = &arg_idents[0];
+                quote!(#arg)
+            }
+            _ => quote!((#(#arg_idents),*)),
+        };
+        let return_ty = method_return_type(&self.func);
+        let call = quote! {
+            ::qi::ObjectExt::call::<#return_ty, _, _>(&self.client, #name, #call_args)
+        };
+        let polled = if self.func.sig.asyncness.is_some() {
+            quote!(#call.await)
+        } else {
+            quote!(::qi::object::block_on(#call))
+        };
+        let body = match &self.func.sig.output {
+            ReturnType::Type(_, ty) if is_result(ty) => {
+                quote!(#polled.map_err(::std::convert::Into::into))
+            }
+            _ => quote!(#polled.expect("remote call failed")),
+        };
+        quote! {
+            #sig {
+                #body
+            }
+        }
+    }
 }
 
 struct Signal {
@@ -307,6 +409,33 @@ impl Signal {
                 {
                     #call.emit(value);
                 }
+            }
+        }
+    }
+
+    fn to_check_tokens(&self) -> TokenStream {
+        let name = &self.name;
+        let ty = payload_type(&self.func);
+        let mismatch = meta_mismatch(name);
+        quote! {
+            {
+                let ident = ::qi::object::MemberIdent::from(#name);
+                let signal = meta.signal(&ident).ok_or_else(|| {
+                    ::qi::Error::MethodNotFound(ident)
+                })?;
+                if signal.signature != <#ty as ::qi::value::Reflect>::signature() {
+                    return ::std::result::Result::Err(#mismatch);
+                }
+            }
+        }
+    }
+
+    fn to_client_item(&self) -> TokenStream {
+        let sig = &self.func.sig;
+        let name = &self.name;
+        quote! {
+            #sig {
+                ::qi::Signal::remote(self.client.clone(), #name)
             }
         }
     }
@@ -359,6 +488,61 @@ impl Property {
                 ::std::result::Result::Ok(::qi::value::IntoValue::into_value(()))
             }
         }
+    }
+
+    fn to_check_tokens(&self) -> TokenStream {
+        let name = &self.name;
+        let ty = payload_type(&self.func);
+        let mismatch = meta_mismatch(name);
+        quote! {
+            {
+                let ident = ::qi::object::MemberIdent::from(#name);
+                let property = meta.property(&ident).ok_or_else(|| {
+                    ::qi::Error::MethodNotFound(ident)
+                })?;
+                if property.signature != <#ty as ::qi::value::Reflect>::signature() {
+                    return ::std::result::Result::Err(#mismatch);
+                }
+            }
+        }
+    }
+
+    fn to_client_item(&self) -> TokenStream {
+        let sig = &self.func.sig;
+        let name = &self.name;
+        quote! {
+            #sig {
+                ::qi::Property::remote(self.client.clone(), #name)
+            }
+        }
+    }
+}
+
+fn client_ident(trait_name: &Ident) -> Ident {
+    Ident::new(&format!("{}Client", trait_name), trait_name.span())
+}
+
+fn parameters_signature(func: &TraitItemFn) -> TokenStream {
+    let tys = func.sig.inputs.iter().filter_map(|input| match input {
+        FnArg::Typed(typed) => Some(&*typed.ty),
+        _ => None,
+    });
+    quote! {
+        {
+            let fields: ::std::vec::Vec<::std::option::Option<::qi::value::Type>> = ::std::vec![
+                #(<#tys as ::qi::value::Reflect>::ty(),)*
+            ];
+            ::qi::value::Signature::new(Some(::qi::value::Type::tuple_of(fields)))
+        }
+    }
+}
+
+fn meta_mismatch(name: &str) -> TokenStream {
+    quote! {
+        ::qi::Error::from(::std::io::Error::new(
+            ::std::io::ErrorKind::InvalidData,
+            ::std::format!("meta object member `{}` has a mismatched signature", #name),
+        ))
     }
 }
 

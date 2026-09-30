@@ -57,7 +57,7 @@ pub mod value;
 pub use self::{
     error::{BoxError, Error, HandlerError},
     node::Node,
-    object::{Object, ObjectExt},
+    object::{Object, ObjectClient, ObjectExt},
     property::Property,
     service_directory::ServiceDirectory,
     session::auth,
