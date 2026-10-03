@@ -53,6 +53,10 @@ pub fn proc_macro_derive_from_value(input: TokenStream) -> TokenStream {
 /// `<TRAIT>_META_OBJECT` as `once_cell::sync::Lazy<qi::object::MetaObject>`,
 /// and implements `qi::Object` for types that implement the trait.
 ///
+/// `#[qi::object(client)]` implements `Object` only for the generated client,
+/// by delegating to its `ObjectClient`. A crate can emit only one blanket
+/// `impl<T: Trait> Object for T`.
+///
 /// # Example
 ///
 /// ```ignore
@@ -72,8 +76,8 @@ pub fn proc_macro_derive_from_value(input: TokenStream) -> TokenStream {
 /// }
 /// ```
 #[proc_macro_attribute]
-pub fn object(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    parse_macro_input!(item as object::Object)
-        .to_token_stream()
-        .into()
+pub fn object(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let mut parsed = parse_macro_input!(item as object::Object);
+    parsed.mode = parse_macro_input!(attr as object::ObjectMode);
+    parsed.to_token_stream().into()
 }

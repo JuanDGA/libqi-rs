@@ -10,6 +10,33 @@ use syn::{
 pub(super) struct Object {
     trait_item: ItemTrait,
     members: Vec<Member>,
+    pub(super) mode: ObjectMode,
+}
+
+/// `client` implements `Object` for the generated client only.
+///
+/// The default mode emits `impl<T: Trait> Object for T`. A crate can contain
+/// one such impl, so a second object trait uses `client` instead.
+pub(super) enum ObjectMode {
+    Blanket,
+    Client,
+}
+
+impl Parse for ObjectMode {
+    fn parse(input: ParseStream) -> Result<Self> {
+        if input.is_empty() {
+            return Ok(Self::Blanket);
+        }
+        let ident: Ident = input.parse()?;
+        if ident != "client" {
+            return Err(Error::new(ident.span(), "expected `client`"));
+        }
+        if input.is_empty() {
+            Ok(Self::Client)
+        } else {
+            Err(Error::new(input.span(), "unexpected tokens after `client`"))
+        }
+    }
 }
 
 impl ToTokens for Object {
@@ -20,7 +47,10 @@ impl ToTokens for Object {
             #trait_item
         });
         self.meta_object().to_tokens(tokens);
-        self.object_impl().to_tokens(tokens);
+        match self.mode {
+            ObjectMode::Blanket => self.object_impl().to_tokens(tokens),
+            ObjectMode::Client => self.client_object_impl().to_tokens(tokens),
+        }
         self.client_impl().to_tokens(tokens);
     }
 }
@@ -41,8 +71,8 @@ impl Object {
         }
     }
 
-    // Each expansion emits `impl<T: Trait> Object for T`, so a crate can
-    // define only one `#[qi::object]` trait.
+    // Default mode emits `impl<T: Trait> Object for T`, so a crate can
+    // define only one such trait. `#[qi::object(client)]` does not emit it.
     fn object_impl(&self) -> TokenStream {
         let trait_ident = &self.trait_item.ident;
         let meta_ident = meta_object_ident(trait_ident);
@@ -156,6 +186,46 @@ impl Object {
         }
     }
 
+    fn client_object_impl(&self) -> TokenStream {
+        let client_ident = client_ident(&self.trait_item.ident);
+        quote! {
+            #[::async_trait::async_trait]
+            impl ::qi::Object for #client_ident {
+                fn meta(&self) -> &::qi::object::MetaObject {
+                    ::qi::Object::meta(&self.client)
+                }
+
+                async fn meta_call(
+                    &self,
+                    ident: ::qi::object::MemberIdent,
+                    args: ::qi::Value<'_>,
+                ) -> ::std::result::Result<::qi::Value<'static>, ::qi::Error> {
+                    ::qi::Object::meta_call(&self.client, ident, args).await
+                }
+
+                async fn meta_post(
+                    &self,
+                    ident: ::qi::object::MemberIdent,
+                    args: ::qi::Value<'_>,
+                ) {
+                    ::qi::Object::meta_post(&self.client, ident, args).await
+                }
+
+                async fn meta_event(
+                    &self,
+                    ident: ::qi::object::MemberIdent,
+                    value: ::qi::Value<'_>,
+                ) {
+                    ::qi::Object::meta_event(&self.client, ident, value).await
+                }
+
+                fn uid(&self) -> ::qi::object::Uid {
+                    ::qi::Object::uid(&self.client)
+                }
+            }
+        }
+    }
+
     fn client_impl(&self) -> TokenStream {
         let vis = &self.trait_item.vis;
         let trait_ident = &self.trait_item.ident;
@@ -216,6 +286,7 @@ impl Parse for Object {
         Ok(Self {
             trait_item,
             members,
+            mode: ObjectMode::Blanket,
         })
     }
 }
