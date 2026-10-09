@@ -74,6 +74,13 @@ pub fn proc_macro_derive_from_value(input: TokenStream) -> TokenStream {
 ///     #[qi::signal]
 ///     fn moving(&self) -> qi::Signal<bool>;
 /// }
+///
+/// #[derive(qi::Valuable)]
+/// #[qi(value(crate = "qi_value"))]
+/// struct Position {
+///     x: u32,
+///     y: u32,
+/// }
 /// ```
 #[proc_macro_attribute]
 pub fn object(attr: TokenStream, item: TokenStream) -> TokenStream {
