@@ -66,7 +66,7 @@ impl<T: Clone> Signal<T> {
         };
         let listeners = listeners.lock().unwrap().clone();
         for listener in listeners {
-            listener(value.clone());
+            listener(value.clone()); // FIXME: Remove this .clone() by allowing to pass a reference to each listener
         }
     }
 
